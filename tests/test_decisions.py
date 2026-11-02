@@ -1,13 +1,16 @@
 """Tests for the decision service client (harness jobs API)."""
 
+import copy
 import unittest
 
 from harness2.decisions.client import (
     CandidateInvalid,
     DecisionClient,
+    Evaluation,
     LeaseLost,
     ServiceError,
 )
+from harness2.decisions.surface import apply_files, changed, context_files, editable_files
 from tests.decisions_fakes import FakeDecisionService, payload
 
 
@@ -124,6 +127,129 @@ class ClientTests(unittest.TestCase):
         svc.stop()
         with self.assertRaises(ServiceError):
             DecisionClient(url, "w1", timeout=2).claim()
+
+
+class SurfaceTests(unittest.TestCase):
+    def setUp(self):
+        self.p = payload()
+        self.routing = self.p["routingQuestion"]
+        self.questions = self.p["decisions"]["questions"]
+
+    def test_editable_files_expose_only_routing_text(self):
+        self.assertEqual(
+            editable_files(self.p),
+            {
+                "surface/routing.md": "Pick the provider best suited to the task.",
+                "surface/choices/claude.md": "Careful reasoning and edits.",
+                "surface/choices/codex.md": "Fast code generation.",
+            },
+        )
+
+    def test_round_trip_without_edits_returns_equal_questions(self):
+        files = editable_files(self.p)
+        self.assertEqual(apply_files(self.questions, self.routing, files), self.questions)
+
+    def test_apply_files_updates_only_routing_text(self):
+        files = editable_files(self.p) | {
+            "surface/routing.md": "Route by task type.",
+            "surface/choices/claude.md": "Phân tích, brainstorm, viết spec.",
+        }
+        out = apply_files(self.questions, self.routing, files)
+        routing = next(q for q in out if q["name"] == self.routing)
+        self.assertEqual(routing["instructions"], "Route by task type.")
+        self.assertEqual(
+            next(c for c in routing["choices"] if c["value"] == "claude")["description"],
+            "Phân tích, brainstorm, viết spec.",
+        )
+        self.assertEqual(
+            [q for q in out if q["name"] != self.routing],
+            [q for q in self.questions if q["name"] != self.routing],
+        )
+
+    def test_apply_files_does_not_mutate_input(self):
+        before = copy.deepcopy(self.questions)
+        apply_files(self.questions, self.routing, editable_files(self.p) | {"surface/routing.md": "new"})
+        self.assertEqual(self.questions, before)
+
+    def test_apply_files_rejects_value_changes(self):
+        files = editable_files(self.p)
+        files["surface/choices/pi.md"] = "x"
+        with self.assertRaisesRegex(ValueError, "pi"):
+            apply_files(self.questions, self.routing, files)
+
+    def test_apply_files_lists_every_problem(self):
+        files = editable_files(self.p)
+        del files["surface/routing.md"]
+        del files["surface/choices/codex.md"]
+        files["surface/choices/pi.md"] = "x"
+        files["surface/choices/claude.md"] = ""
+        with self.assertRaises(ValueError) as caught:
+            apply_files(self.questions, self.routing, files)
+        message = str(caught.exception)
+        for part in ("routing.md", "codex", "pi", "claude"):
+            self.assertIn(part, message)
+
+    def test_apply_files_rejects_cr_nul_and_blank(self):
+        for bad in ("a" + chr(13) + chr(10) + "b", "a" + chr(0) + "b", "   " + chr(10)):
+            with self.subTest(bad=bad):
+                files = editable_files(self.p) | {"surface/routing.md": bad}
+                with self.assertRaisesRegex(ValueError, "routing.md"):
+                    apply_files(self.questions, self.routing, files)
+
+    def test_editable_files_rejects_unsafe_choice_value(self):
+        for value in ("../x", "a/b", "a" + chr(92) + "b", "..", "C:x", "a b", "x."):
+            with self.subTest(value=value):
+                p = payload()
+                p["decisions"]["questions"][0]["choices"][0]["value"] = value
+                with self.assertRaisesRegex(ValueError, "choice"):
+                    editable_files(p)
+
+    def test_context_describes_in_assertions(self):
+        p = payload(testCases=[{"id": "t1", "input": "…", "expected": None,
+                                "assertion": {"operator": "in", "expected_value": ["codex", "antigravity"]}}])
+        text = context_files(p, None, "")["brief/failures.md"]
+        self.assertIn("phải là một trong codex, antigravity", text)
+
+    def test_context_failures_use_baseline_without_evaluation(self):
+        failures = context_files(self.p, None, "")["brief/failures.md"]
+        self.assertIn("Refactor this module", failures)
+        self.assertIn("phải là claude", failures)
+        self.assertNotIn("Generate a quick script", failures)  # tc-2 passes in the baseline
+
+    def test_context_failures_use_evaluation_when_given(self):
+        evaluation = Evaluation(
+            accuracy=0.5,
+            results=[
+                {"testCaseId": "tc-1", "actual": "claude", "pass": True},
+                {"testCaseId": "tc-2", "actual": "pi", "pass": False},
+            ],
+        )
+        failures = context_files(self.p, evaluation, "")["brief/failures.md"]
+        self.assertNotIn("Refactor this module", failures)
+        self.assertIn("Generate a quick script", failures)
+        self.assertIn("đang trả lời: pi", failures)
+        self.assertIn("phải là một trong codex, claude", failures)
+
+    def test_context_other_files(self):
+        files = context_files(self.p, None, "tried X, did not help")
+        self.assertEqual(files["brief/experience.md"], "tried X, did not help")
+        self.assertIn("needs careful reasoning", files["brief/reports.md"])
+        self.assertIn("confidence", files["brief/other_questions.md"])
+        self.assertNotIn("Fast code generation", files["brief/other_questions.md"])
+        for key in files:
+            self.assertNotIn(chr(92), key)
+
+    def test_changed_lists_each_edit(self):
+        files = editable_files(self.p) | {
+            "surface/routing.md": "new routing",
+            "surface/choices/codex.md": "new codex",
+        }
+        after = apply_files(self.questions, self.routing, files)
+        self.assertEqual(
+            changed(self.questions, after, self.routing),
+            ["routing instructions", "choice codex description"],
+        )
+        self.assertEqual(changed(self.questions, self.questions, self.routing), [])
 
 
 if __name__ == "__main__":
