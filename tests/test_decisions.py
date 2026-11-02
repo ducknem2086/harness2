@@ -196,6 +196,35 @@ class SurfaceTests(unittest.TestCase):
                 with self.assertRaisesRegex(ValueError, "routing.md"):
                     apply_files(self.questions, self.routing, files)
 
+    def test_unedited_invalid_originals_are_accepted(self):
+        for original in ("", "  ", "a" + chr(13) + chr(10) + "b", "a" + chr(0) + "b"):
+            with self.subTest(original=original):
+                p = payload()
+                question = p["decisions"]["questions"][0]
+                question["instructions"] = original
+                question["choices"][0]["description"] = original
+                files = editable_files(p)
+                self.assertEqual(
+                    apply_files(p["decisions"]["questions"], p["routingQuestion"], files),
+                    p["decisions"]["questions"],
+                )
+
+    def test_editing_an_empty_original_is_still_checked(self):
+        p = payload()
+        p["decisions"]["questions"][0]["choices"][0]["description"] = ""
+        files = editable_files(p)
+        files["surface/choices/claude.md"] = " "
+        with self.assertRaisesRegex(ValueError, "claude"):
+            apply_files(p["decisions"]["questions"], p["routingQuestion"], files)
+        files["surface/choices/claude.md"] = "Now described."
+        out = apply_files(p["decisions"]["questions"], p["routingQuestion"], files)
+        self.assertEqual(out[0]["choices"][0]["description"], "Now described.")
+
+    def test_blanking_a_non_empty_description_is_rejected(self):
+        files = editable_files(self.p) | {"surface/choices/codex.md": ""}
+        with self.assertRaisesRegex(ValueError, "codex"):
+            apply_files(self.questions, self.routing, files)
+
     def test_editable_files_rejects_unsafe_choice_value(self):
         for value in ("../x", "a/b", "a" + chr(92) + "b", "..", "C:x", "a b", "x."):
             with self.subTest(value=value):

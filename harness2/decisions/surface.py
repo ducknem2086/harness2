@@ -61,8 +61,12 @@ def apply_files(questions: list[dict], routing: str, files: dict[str, str]) -> l
             problems.append(f"unknown choice file {key} (choice values cannot be added or renamed)")
         else:
             problems.append(f"unknown file {key}")
+    originals = {ROUTING_KEY: question.get("instructions", "")}
+    originals.update({f"{CHOICES_PREFIX}{v}.md": c.get("description", "") for v, c in choices.items()})
     for key in sorted(expected_keys & files.keys()):
         text = files[key]
+        if text == originals[key]:
+            continue  # untouched text is always accepted, even if it would not be valid as an edit
         if not isinstance(text, str) or not text.strip():
             problems.append(f"{key} is empty")
         elif "\r" in text or "\x00" in text:
