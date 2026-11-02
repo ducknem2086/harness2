@@ -1,14 +1,21 @@
 """Tests for the decision worker: service client, routing surface, proposer sessions."""
 
+import contextlib
 import copy
+import io
 import json
 import os
 import shutil
+import socket
 import tempfile
+import threading
+import time
 import unittest
 from pathlib import Path
 from unittest.mock import patch
 
+from harness2 import config
+from harness2.cli import decision_worker
 from harness2.core.proposer import ProposerError
 from harness2.decisions.client import (
     CandidateInvalid,
@@ -137,6 +144,45 @@ class ClientTests(unittest.TestCase):
         svc.stop()
         with self.assertRaises(ServiceError):
             DecisionClient(url, "w1", timeout=2).claim()
+
+    def test_response_cut_short_raises_service_error(self):
+        # The service dies mid-response: urllib raises http.client.IncompleteRead, which is
+        # an HTTPException rather than an OSError.
+        for status in (200, 500):
+            with self.subTest(status=status), TruncatingServer(status) as url:
+                with self.assertRaises(ServiceError):
+                    DecisionClient(url, "w1", timeout=5).claim()
+
+
+class TruncatingServer:
+    """Answers one request with a Content-Length it does not honour, then hangs up."""
+
+    def __init__(self, status: int):
+        self.status = status
+        self.listener = socket.socket()
+        self.listener.bind(("127.0.0.1", 0))
+        self.listener.listen(1)
+        self.url = f"http://127.0.0.1:{self.listener.getsockname()[1]}"
+
+    def __enter__(self) -> str:
+        threading.Thread(target=self._serve, daemon=True).start()
+        return self.url
+
+    def __exit__(self, *exc_info) -> None:
+        self.listener.close()
+
+    def _serve(self) -> None:
+        try:
+            conn, _ = self.listener.accept()
+        except OSError:
+            return
+        with conn:
+            conn.settimeout(5)
+            conn.recv(65536)
+            conn.sendall(
+                f"HTTP/1.1 {self.status} X\r\nContent-Type: application/json\r\n"
+                f"Content-Length: 200\r\n\r\n".encode() + b'{"jobId": "j'
+            )
 
 
 class SurfaceTests(unittest.TestCase):
@@ -634,6 +680,229 @@ class ExperienceLibraryTests(unittest.TestCase):
     def test_key_with_no_safe_characters_still_gets_a_file(self):
         self.library.record("///", self.entry(1))
         self.assertIn("lesson number 1", self.library.notes("///"))
+
+
+class WorkerClient(DecisionClient):
+    """Records which thread heartbeats and which results are posted."""
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.heartbeat_threads: list[threading.Thread] = []
+        self.posted: list[str] = []
+        self.thread_heartbeat_error: Exception | None = None
+
+    def heartbeat(self, job_id):
+        thread = threading.current_thread()
+        self.heartbeat_threads.append(thread)
+        if self.thread_heartbeat_error is not None and thread is not threading.main_thread():
+            raise self.thread_heartbeat_error
+        return super().heartbeat(job_id)
+
+    def succeed(self, job_id, questions, report):
+        self.posted.append("succeed")
+        return super().succeed(job_id, questions, report)
+
+    def no_improvement(self, job_id, report):
+        self.posted.append("no_improvement")
+        return super().no_improvement(job_id, report)
+
+    def fail(self, job_id, reason):
+        self.posted.append("fail")
+        return super().fail(job_id, reason)
+
+
+class RaisingProposer(FakeProposer):
+    """A proposer that breaks outside the session, so the core cannot wrap the error."""
+
+    def call(self, mission, context_dir, label, **kwargs):
+        raise RuntimeError("proposer exploded")
+
+
+class WorkerTests(unittest.TestCase):
+    def setUp(self):
+        self.audit = Path(tempfile.mkdtemp(prefix="decisions-audit-"))
+        self.addCleanup(shutil.rmtree, self.audit, ignore_errors=True)
+        self.library = ExperienceLibrary(Path(tempfile.mkdtemp(prefix="decisions-library-")))
+        self.addCleanup(shutil.rmtree, self.library.root, ignore_errors=True)
+        self.svc = FakeDecisionService().start()
+        self.addCleanup(self.svc.stop)
+        self.svc.answers = brainstorm_aware
+        self.client = WorkerClient(self.svc.url, "w1")
+
+    def proposer(self, edits: list, cls=FakeProposer) -> FakeProposer:
+        return cls(edits=edits, audit_dir=self.audit)
+
+    def run_once(self, proposer, k=3, **kwargs) -> str:
+        return decision_worker.run_once(self.client, proposer, self.library, k, **kwargs)
+
+    def test_run_once_is_idle_without_jobs(self):
+        proposer = self.proposer([])
+        self.assertEqual(self.run_once(proposer), "idle")
+        self.assertEqual(proposer.sessions, [])
+        self.assertEqual(self.client.posted, [])
+
+    def test_run_once_posts_succeeded_with_questions(self):
+        self.svc.queue(improve_payload())
+        proposer = self.proposer([WEAK, STRONG, WEAK, STRONG_AND_MORE])
+        self.assertEqual(self.run_once(proposer), "succeeded")
+        result = self.svc.results[-1]
+        self.assertEqual(result["outcome"], "succeeded")
+        self.assertEqual(result["worker"], "w1")
+        claude = next(c for c in result["questions"][0]["choices"] if c["value"] == "claude")
+        self.assertIn("brainstorm", claude["description"])
+        self.assertIn("summary", result["report"])
+
+    def test_run_once_posts_no_improvement_without_questions(self):
+        self.svc.queue(improve_payload())
+        self.assertEqual(self.run_once(self.proposer([WEAK, WEAK, WEAK])), "no-improvement")
+        result = self.svc.results[-1]
+        self.assertEqual(result["outcome"], "no-improvement")
+        self.assertNotIn("questions", result)
+
+    def test_run_once_posts_failed_on_unexpected_error(self):
+        self.svc.queue(improve_payload())
+        with self.assertLogs(decision_worker.log, level="WARNING"):
+            outcome = self.run_once(self.proposer([WEAK], RaisingProposer))
+        self.assertEqual(outcome, "failed")
+        result = self.svc.results[-1]
+        self.assertEqual(result["outcome"], "failed")
+        self.assertEqual(result["reason"], "RuntimeError: proposer exploded")
+
+    def test_lease_loss_posts_nothing(self):
+        job_id = self.svc.queue(improve_payload())
+        proposer = self.proposer([STRONG, STRONG, STRONG])
+        original = proposer._claude_cli
+
+        def lose_lease_mid_session(cwd, mission, system, wall):
+            self.svc.lose_lease(job_id)
+            return original(cwd, mission, system, wall)
+
+        proposer._claude_cli = lose_lease_mid_session
+        with self.assertLogs(decision_worker.log, level="WARNING"):
+            self.assertEqual(self.run_once(proposer), "lease-lost")
+        self.assertEqual(self.svc.results, [])
+        self.assertEqual(self.client.posted, [])
+
+    def test_worker_survives_service_outage(self):
+        self.svc.queue(improve_payload())
+        proposer = self.proposer([STRONG, STRONG, STRONG])
+        original = proposer._claude_cli
+
+        def die_mid_session(cwd, mission, system, wall):
+            self.svc.stop()
+            return original(cwd, mission, system, wall)
+
+        proposer._claude_cli = die_mid_session
+        with self.assertLogs(decision_worker.log, level="WARNING"):
+            self.assertEqual(self.run_once(proposer), "failed")
+        self.assertEqual(self.client.posted, ["fail"])  # tried to tell the dead service
+        with FakeDecisionService() as fresh:
+            client = DecisionClient(fresh.url, "w1")
+            outcome = decision_worker.run_once(client, self.proposer([]), self.library, 3)
+        self.assertEqual(outcome, "idle")
+
+    def sleepy(self, proposer: FakeProposer, before=None, seconds: float = 0.4) -> None:
+        original = proposer._claude_cli
+
+        def slow_session(cwd, mission, system, wall):
+            if before is not None:
+                before()
+            time.sleep(seconds)
+            return original(cwd, mission, system, wall)
+
+        proposer._claude_cli = slow_session
+
+    def test_heartbeat_thread_keeps_the_lease_during_a_long_session(self):
+        self.svc.queue(improve_payload())
+        proposer = self.proposer([WEAK])
+        self.sleepy(proposer)
+        self.assertEqual(self.run_once(proposer, k=1, heartbeat_seconds=0.05), "no-improvement")
+        background = [t for t in self.client.heartbeat_threads if t is not threading.main_thread()]
+        self.assertGreaterEqual(len(background), 3)
+        self.assertEqual([t for t in threading.enumerate() if t in background and t.is_alive()], [])
+
+    def test_heartbeat_thread_sees_lease_loss_and_nothing_is_posted(self):
+        job_id = self.svc.queue(improve_payload())
+        proposer = self.proposer([{}])  # no edit: improve finishes without another service call
+        self.sleepy(proposer, before=lambda: self.svc.lose_lease(job_id))
+        with self.assertLogs(decision_worker.log, level="WARNING"):
+            self.assertEqual(self.run_once(proposer, k=1, heartbeat_seconds=0.05), "lease-lost")
+        self.assertEqual(self.client.posted, [])
+        self.assertEqual(self.svc.results, [])
+
+    def test_heartbeat_thread_outage_is_ignored(self):
+        self.svc.queue(improve_payload())
+        self.client.thread_heartbeat_error = ServiceError("blip")
+        proposer = self.proposer([WEAK])
+        self.sleepy(proposer)
+        self.assertEqual(self.run_once(proposer, k=1, heartbeat_seconds=0.05), "no-improvement")
+        background = [t for t in self.client.heartbeat_threads if t is not threading.main_thread()]
+        self.assertGreaterEqual(len(background), 2)  # it kept beating after the first error
+
+    def test_heartbeat_thread_stops_when_the_job_fails(self):
+        self.svc.queue(improve_payload())
+        with self.assertLogs(decision_worker.log, level="WARNING"):
+            self.run_once(self.proposer([WEAK], RaisingProposer), heartbeat_seconds=0.05)
+        self.assertEqual([t for t in threading.enumerate() if t.name == "lease-keeper"], [])
+
+
+class WorkerMainTests(unittest.TestCase):
+    def setUp(self):
+        patcher = patch.object(decision_worker, "_configure_logging")
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        self.tmp = Path(tempfile.mkdtemp(prefix="decisions-main-"))
+        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
+
+    def argv(self, url: str, *extra: str) -> list[str]:
+        return [
+            "--decision-url", url,
+            "--library-dir", str(self.tmp / "library"),
+            "--audit-dir", str(self.tmp / "audit"),
+            *extra,
+        ]  # fmt: skip
+
+    def test_defaults(self):
+        args = decision_worker.build_parser().parse_args([])
+        self.assertEqual(args.decision_url, "http://localhost:3000")
+        self.assertRegex(args.worker_id, rf"-{os.getpid()}$")
+        self.assertEqual((args.k, args.model, args.poll_seconds, args.once), (3, "", 30, False))
+        self.assertEqual(args.library_dir, config.RUNS / "decisions" / "library")
+        self.assertEqual(args.audit_dir, config.RUNS / "decisions" / "audit")
+
+    def test_once_exits_zero_when_idle(self):
+        with FakeDecisionService() as svc, contextlib.redirect_stdout(io.StringIO()) as out:
+            self.assertEqual(decision_worker.main(self.argv(svc.url, "--once")), 0)
+        self.assertEqual(out.getvalue().strip(), "idle")
+
+    def test_once_exits_one_when_the_service_is_down(self):
+        svc = FakeDecisionService().start()
+        url = svc.url
+        svc.stop()
+        with self.assertLogs(decision_worker.log, level="WARNING"):
+            self.assertEqual(decision_worker.main(self.argv(url, "--once")), 1)
+
+    def test_loop_sleeps_when_idle_and_ctrl_c_exits_zero(self):
+        outcomes = ["idle", "succeeded", KeyboardInterrupt()]
+        with (
+            patch.object(decision_worker, "run_once", side_effect=outcomes) as run_once,
+            patch.object(decision_worker.time, "sleep") as sleep,
+        ):
+            code = decision_worker.main(self.argv("http://127.0.0.1:9", "--poll-seconds", "7"))
+        self.assertEqual(code, 0)
+        self.assertEqual(run_once.call_count, 3)
+        sleep.assert_called_once_with(7)  # only the idle round waits
+
+    def test_loop_keeps_going_when_claim_fails(self):
+        outcomes = [ServiceError("down"), "idle", KeyboardInterrupt()]
+        with (
+            patch.object(decision_worker, "run_once", side_effect=outcomes),
+            patch.object(decision_worker.time, "sleep") as sleep,
+            self.assertLogs(decision_worker.log, level="WARNING"),
+        ):
+            code = decision_worker.main(self.argv("http://127.0.0.1:9", "--poll-seconds", "5"))
+        self.assertEqual(code, 0)
+        self.assertEqual(sleep.call_count, 2)
 
 
 if __name__ == "__main__":

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import http.client
 import json
 import urllib.error
 import urllib.request
@@ -105,10 +106,15 @@ class DecisionClient:
         except urllib.error.HTTPError as exc:
             try:
                 error_body = self._decode(exc.read())
+            except (http.client.HTTPException, OSError) as read_error:
+                raise ServiceError(
+                    f"{path}: HTTP {exc.code}, body cut short: {read_error!r}"
+                ) from read_error
             finally:
                 exc.close()
             self._raise_for_error(exc.code, error_body)
-        except (urllib.error.URLError, OSError) as exc:  # includes timeouts
+        # URLError and timeouts are OSErrors; a response cut short is an HTTPException.
+        except (urllib.error.URLError, OSError, http.client.HTTPException) as exc:
             raise ServiceError(f"{path}: {exc}") from exc
         raise AssertionError("unreachable")  # pragma: no cover
 
