@@ -1,6 +1,7 @@
 """Tests for the decision worker: service client, routing surface, proposer sessions."""
 
 import copy
+import json
 import os
 import shutil
 import tempfile
@@ -16,6 +17,8 @@ from harness2.decisions.client import (
     LeaseLost,
     ServiceError,
 )
+from harness2.decisions.improve import improve
+from harness2.decisions.library import ExperienceLibrary
 from harness2.decisions.proposer import MISSION, make_proposer, propose
 from harness2.decisions.surface import apply_files, changed, context_files, editable_files
 from tests.decisions_fakes import FakeDecisionService, FakeProposer, payload
@@ -357,6 +360,280 @@ class ProposerTests(unittest.TestCase):
     def test_mission_names_the_rules(self):
         for needle in ("context/surface/", "context/brief/", "failures.md"):
             self.assertIn(needle, MISSION)
+
+
+BRAINSTORM_CASE = {
+    "id": "t-brainstorm",
+    "input": "Brainstorm names for the new product.",
+    "expected": "claude",
+    "assertion": {"operator": "equals", "expected_value": "claude"},
+    "origin": "user",
+}
+
+
+def brainstorm_aware(questions: list[dict], test_case: dict) -> str:
+    """Router stand-in: it gets the brainstorm case right once claude's description mentions it."""
+    claude = next(c for c in questions[0]["choices"] if c["value"] == "claude")
+    if test_case["id"] == "t-brainstorm" and "brainstorm" not in claude["description"].lower():
+        return "codex"
+    expected = test_case["assertion"]["expected_value"]
+    return expected[0] if isinstance(expected, list) else expected
+
+
+def improve_payload() -> dict:
+    base = payload()
+    return payload(
+        testCases=[*base["testCases"], BRAINSTORM_CASE],
+        baseline={
+            "accuracy": 2 / 3,
+            "results": [
+                {"testCaseId": "tc-1", "actual": "claude", "pass": True},
+                {"testCaseId": "tc-2", "actual": "codex", "pass": True},
+                {"testCaseId": "t-brainstorm", "actual": "codex", "pass": False},
+            ],
+        },
+    )
+
+
+WEAK = {"surface/routing.md": "Pick the provider best suited to the task, with care."}
+STRONG = {"surface/choices/claude.md": "Careful reasoning, edits and brainstorm sessions."}
+STRONG_AND_MORE = {
+    "surface/routing.md": "Choose the provider that fits the task.",
+    "surface/choices/claude.md": "Careful reasoning, edits and brainstorm sessions.",
+}
+
+
+class RecordingClient(DecisionClient):
+    """A client that logs heartbeat and evaluate calls into a shared event list."""
+
+    def __init__(self, *args, events: list[str], **kwargs):
+        super().__init__(*args, **kwargs)
+        self.events = events
+
+    def heartbeat(self, job_id):
+        self.events.append("heartbeat")
+        return super().heartbeat(job_id)
+
+    def evaluate(self, job_id, questions):
+        self.events.append("evaluate")
+        return super().evaluate(job_id, questions)
+
+
+class ImproveTests(unittest.TestCase):
+    def setUp(self):
+        self.audit = Path(tempfile.mkdtemp(prefix="decisions-audit-"))
+        self.addCleanup(shutil.rmtree, self.audit, ignore_errors=True)
+        self.library = ExperienceLibrary(Path(tempfile.mkdtemp(prefix="decisions-library-")))
+        self.addCleanup(shutil.rmtree, self.library.root, ignore_errors=True)
+        self.events: list[str] = []
+        self.svc = FakeDecisionService().start()
+        self.addCleanup(self.svc.stop)
+        self.svc.answers = brainstorm_aware
+        self.client = RecordingClient(self.svc.url, "w1", events=self.events)
+
+    def claim(self, job_payload: dict | None = None):
+        self.svc.queue(job_payload or improve_payload())
+        return self.client.claim()
+
+    def proposer(self, edits: list) -> FakeProposer:
+        return FakeProposer(edits=edits, audit_dir=self.audit, events=self.events)
+
+    def test_best_candidate_above_baseline_succeeds(self):
+        job = self.claim()
+        proposer = self.proposer([WEAK, STRONG, WEAK, STRONG_AND_MORE])
+        outcome = improve(job, self.client, proposer, self.library, k=3)
+        self.assertEqual(outcome.kind, "succeeded")
+        report = outcome.report
+        self.assertGreater(report["bestAccuracy"], report["baselineAccuracy"])
+        self.assertEqual(report["bestAccuracy"], 1.0)
+        self.assertIn("t-brainstorm", report["fixed"])
+        self.assertEqual(report["stillFailing"], [])
+        # compose ties with the strong candidate on accuracy and changes more, so the strong one wins
+        self.assertEqual(report["changes"], ["choice claude description"])
+        self.assertEqual(
+            [c["label"] for c in report["candidates"]],
+            [f"{job.id}-p0", f"{job.id}-p1", f"{job.id}-p2", f"{job.id}-compose"],
+        )
+        self.assertEqual(proposer.labels, [c["label"] for c in report["candidates"]])
+        question = outcome.questions[0]
+        self.assertEqual(question["choices"][0]["description"], STRONG["surface/choices/claude.md"])
+        self.assertEqual(question["instructions"], job.payload["decisions"]["questions"][0]["instructions"])
+        self.assertEqual(self.svc.results, [])  # improve only decides; the worker posts
+
+    def test_compose_session_gets_the_two_best_candidates_and_their_results(self):
+        job = self.claim()
+        proposer = self.proposer([WEAK, STRONG, WEAK, STRONG_AND_MORE])
+        improve(job, self.client, proposer, self.library, k=3)
+        compose = proposer.sessions[3]
+        self.assertEqual(
+            compose["brief/candidate_a/choices/claude.md"].decode(), STRONG["surface/choices/claude.md"]
+        )
+        self.assertEqual(compose["brief/candidate_b/routing.md"].decode(), WEAK["surface/routing.md"])
+        self.assertIn("ĐẠT", compose["brief/candidate_a/results.md"].decode())
+        results_b = compose["brief/candidate_b/results.md"].decode()
+        self.assertIn("SAI", results_b)
+        self.assertIn("t-brainstorm", results_b)
+        # the editable surface the compose session starts from is the original text
+        self.assertEqual(compose["surface/choices/claude.md"].decode(), "Careful reasoning and edits.")
+
+    def test_no_candidate_beats_baseline(self):
+        job = self.claim()
+        outcome = improve(job, self.client, self.proposer([WEAK, WEAK, WEAK, WEAK]), self.library, k=3)
+        self.assertEqual(outcome.kind, "no-improvement")
+        self.assertIsNone(outcome.questions)
+        self.assertEqual(outcome.report["bestAccuracy"], outcome.report["baselineAccuracy"])
+        self.assertEqual(outcome.report["stillFailing"], ["t-brainstorm"])
+
+    def test_proposer_failure_skips_candidate(self):
+        job = self.claim()
+        proposer = self.proposer([ProposerError("x"), STRONG, WEAK, WEAK])
+        outcome = improve(job, self.client, proposer, self.library, k=3)
+        self.assertEqual(outcome.kind, "succeeded")
+        first = outcome.report["candidates"][0]
+        self.assertIsNone(first["accuracy"])
+        self.assertIn("x", first["error"])
+        self.assertIsNone(outcome.report["candidates"][1]["error"])
+
+    def test_candidate_that_adds_a_choice_is_not_evaluated(self):
+        job = self.claim()
+        bad = {"surface/choices/gemini.md": "A new provider."}
+        outcome = improve(job, self.client, self.proposer([bad, bad]), self.library, k=2)
+        self.assertEqual(outcome.kind, "no-improvement")
+        self.assertNotIn("evaluate", self.events)
+        for candidate in outcome.report["candidates"]:
+            self.assertIn("gemini", candidate["error"])
+
+    def test_candidate_rejected_by_the_service_is_reported(self):
+        job = self.claim()
+        self.svc.invalid_detail = "choice values changed"
+        outcome = improve(job, self.client, self.proposer([STRONG, STRONG]), self.library, k=2)
+        self.assertEqual(outcome.kind, "no-improvement")
+        self.assertIn("choice values changed", outcome.report["candidates"][0]["error"])
+        self.assertEqual(len(outcome.report["candidates"]), 2)  # nothing graded, so no compose
+
+    def test_unchanged_candidate_is_not_scored_against_the_baseline(self):
+        job = self.claim()
+        outcome = improve(job, self.client, self.proposer([{}, {}]), self.library, k=2)
+        self.assertEqual(outcome.kind, "no-improvement")
+        self.assertNotIn("evaluate", self.events)
+        self.assertIn("no change", outcome.report["candidates"][0]["error"])
+
+    def test_tie_prefers_the_candidate_with_fewer_changes(self):
+        job = self.claim()
+        proposer = self.proposer([STRONG_AND_MORE, STRONG, WEAK])
+        outcome = improve(job, self.client, proposer, self.library, k=2)
+        self.assertEqual(outcome.kind, "succeeded")
+        self.assertEqual(outcome.report["changes"], ["choice claude description"])
+
+    def test_heartbeat_runs_before_each_session_and_evaluation(self):
+        job = self.claim()
+        self.events.clear()
+        improve(job, self.client, self.proposer([STRONG, WEAK, WEAK]), self.library, k=2)
+        # two proposals and one compose, each: heartbeat, session, heartbeat, evaluate
+        self.assertEqual(self.events, ["heartbeat", "session", "heartbeat", "evaluate"] * 3)
+
+    def test_lease_loss_propagates(self):
+        job = self.claim()
+        self.svc.lose_lease(job.id)
+        with self.assertRaises(LeaseLost):
+            improve(job, self.client, self.proposer([STRONG, STRONG, STRONG]), self.library, k=3)
+        self.assertEqual(self.svc.results, [])
+        self.assertEqual(self.library.notes("wf-1"), "")
+
+    def test_lease_loss_during_a_session_propagates(self):
+        job = self.claim()
+        proposer = self.proposer([STRONG, STRONG])
+        original = proposer._claude_cli
+
+        def lose_lease_mid_session(cwd, mission, system, wall):
+            self.svc.lose_lease(job.id)
+            return original(cwd, mission, system, wall)
+
+        proposer._claude_cli = lose_lease_mid_session
+        with self.assertRaises(LeaseLost):
+            improve(job, self.client, proposer, self.library, k=2)
+        self.assertEqual(self.library.notes("wf-1"), "")
+
+    def test_library_notes_feed_the_next_job(self):
+        first = improve(self.claim(), self.client, self.proposer([STRONG, WEAK, WEAK]), self.library, k=2)
+        summary = first.report["summary"]
+        self.assertIn(summary, self.library.notes("wf-1"))
+        proposer = self.proposer([WEAK, WEAK, WEAK])
+        improve(self.claim(), self.client, proposer, self.library, k=2)
+        self.assertIn(summary, proposer.sessions[0]["brief/experience.md"].decode())
+
+    def test_first_job_still_gets_an_experience_file(self):
+        proposer = self.proposer([WEAK, WEAK, WEAK])
+        improve(self.claim(), self.client, proposer, self.library, k=2)
+        self.assertTrue(proposer.sessions[0]["brief/experience.md"].decode().strip())
+
+    def test_job_is_recorded_in_the_library(self):
+        job = self.claim()
+        improve(job, self.client, self.proposer([WEAK, WEAK, WEAK]), self.library, k=2)
+        notes = self.library.notes("wf-1")
+        self.assertIn(job.id, notes)
+        self.assertIn("no-improvement", notes)
+
+
+class ExperienceLibraryTests(unittest.TestCase):
+    def setUp(self):
+        self.root = Path(tempfile.mkdtemp(prefix="decisions-library-"))
+        self.addCleanup(shutil.rmtree, self.root, ignore_errors=True)
+        self.library = ExperienceLibrary(self.root / "nested")
+
+    def entry(self, n: int) -> dict:
+        return {
+            "jobId": f"job-{n}",
+            "baseVersion": n,
+            "baselineAccuracy": 0.5,
+            "bestAccuracy": 0.75,
+            "outcome": "succeeded",
+            "changes": ["routing instructions"],
+            "summary": f"lesson number {n}",
+        }
+
+    def test_notes_are_empty_without_history(self):
+        self.assertEqual(self.library.notes("wf"), "")
+
+    def test_notes_list_newest_first_up_to_the_limit(self):
+        for n in range(1, 5):
+            self.library.record("wf", self.entry(n))
+        notes = self.library.notes("wf", limit=2)
+        self.assertNotIn("lesson number 2", notes)
+        self.assertLess(notes.index("lesson number 4"), notes.index("lesson number 3"))
+        self.assertEqual(self.library.notes("wf"), self.library.notes("wf", limit=10))
+
+    def test_workflows_do_not_share_notes(self):
+        self.library.record("wf-a", self.entry(1))
+        self.assertEqual(self.library.notes("wf-b"), "")
+
+    def test_record_appends_one_json_line_in_a_slugged_file(self):
+        self.library.record("a/b:c ../d", self.entry(1))
+        self.library.record("a/b:c ../d", self.entry(2))
+        files = list((self.root / "nested").iterdir())
+        self.assertEqual([f.name for f in files], ["abc..d.jsonl"])
+        lines = files[0].read_text(encoding="utf-8").splitlines()
+        self.assertEqual([json.loads(line)["jobId"] for line in lines], ["job-1", "job-2"])
+
+    def test_non_ascii_text_round_trips(self):
+        entry = self.entry(1)
+        entry["summary"] = "Đã sửa mô tả của claude"
+        self.library.record("wf", entry)
+        self.assertIn(entry["summary"], self.library.notes("wf"))
+
+    def test_a_torn_line_does_not_hide_the_others(self):
+        self.library.record("wf", self.entry(1))
+        path = next((self.root / "nested").iterdir())
+        with path.open("a", encoding="utf-8") as handle:
+            handle.write('{"jobId": "job-2", "summ\n')
+        self.library.record("wf", self.entry(3))
+        notes = self.library.notes("wf")
+        self.assertIn("lesson number 1", notes)
+        self.assertIn("lesson number 3", notes)
+
+    def test_key_with_no_safe_characters_still_gets_a_file(self):
+        self.library.record("///", self.entry(1))
+        self.assertIn("lesson number 1", self.library.notes("///"))
 
 
 if __name__ == "__main__":

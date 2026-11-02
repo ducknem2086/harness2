@@ -247,29 +247,58 @@ class FakeProposer(LocalClaudeProposer):
     """A proposer whose session edits files instead of running the Claude CLI.
 
     `edit` maps a context-relative key (e.g. "surface/routing.md") to the text the
-    session leaves there. `seen` records the bytes of every context file the
-    session found. `drop_surface=True` simulates a session that removed `surface/`.
+    session leaves there; every session does the same. `edits` instead gives one
+    entry per session, in call order: a dict like `edit`, or an exception to raise
+    from that session (the core wraps it in a `ProposerError`). `seen` records the
+    bytes of every context file any session found and `sessions` the same per
+    session; `labels` lists the label of every call; `events` (when given) gets a
+    "session" entry whenever a session starts. `drop_surface=True` simulates a
+    session that removed `surface/`. A single attempt per session, so a failing
+    session neither retries nor consumes the next entry of `edits`.
     """
 
     def __init__(
         self,
-        edit: dict[str, str],
+        edit: dict[str, str] | None = None,
         audit_dir: Path | None = None,
         drop_surface: bool = False,
+        edits: list[dict[str, str] | Exception] | None = None,
+        events: list[str] | None = None,
     ) -> None:
-        super().__init__(ChannelSpec("claude_cli", ""), audit_dir=audit_dir)
-        self.edit = edit
+        super().__init__(ChannelSpec("claude_cli", ""), audit_dir=audit_dir, attempts=1)
+        self.edit = edit or {}
+        self.edits = edits
         self.drop_surface = drop_surface
+        self.events = events
         self.seen: dict[str, bytes] = {}
+        self.sessions: list[dict[str, bytes]] = []
+        self.labels: list[str] = []
+
+    def call(self, mission, context_dir, label, **kwargs):
+        self.labels.append(label)
+        return super().call(mission, context_dir, label, **kwargs)
 
     def _claude_cli(self, cwd: Path, mission: str, system: str, wall: int):
+        if self.events is not None:
+            self.events.append("session")
         context = cwd / "context"
+        session: dict[str, bytes] = {}
         for path in context.rglob("*"):
             if path.is_file():
-                self.seen[path.relative_to(context).as_posix()] = path.read_bytes()
+                session[path.relative_to(context).as_posix()] = path.read_bytes()
+        self.seen.update(session)
+        self.sessions.append(session)
+        edit = self.edit
+        if self.edits is not None:
+            index = len(self.sessions) - 1
+            if index >= len(self.edits):
+                raise AssertionError(f"unexpected session {index + 1}: only {len(self.edits)} edits given")
+            edit = self.edits[index]
+            if isinstance(edit, Exception):
+                raise edit
         if self.drop_surface:
             shutil.rmtree(context / "surface", ignore_errors=True)
-        for key, text in self.edit.items():
+        for key, text in edit.items():
             target = context / key
             target.parent.mkdir(parents=True, exist_ok=True)
             with target.open("w", encoding="utf-8", newline="") as handle:
