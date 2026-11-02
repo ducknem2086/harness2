@@ -5,9 +5,14 @@ from __future__ import annotations
 import copy
 import json
 import re
+import shutil
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
 from typing import Callable
+
+from harness2.core.spec import ChannelSpec
+from harness2.decisions.proposer import LocalClaudeProposer
 
 LEASE_UNTIL = "2099-01-01T00:00:00.000Z"
 
@@ -236,3 +241,37 @@ class FakeDecisionService:
         if outcome == "succeeded":
             return {"status": "succeeded", "version": self._payloads[job_id]["baseVersion"] + 1}
         return {"status": outcome}
+
+
+class FakeProposer(LocalClaudeProposer):
+    """A proposer whose session edits files instead of running the Claude CLI.
+
+    `edit` maps a context-relative key (e.g. "surface/routing.md") to the text the
+    session leaves there. `seen` records the bytes of every context file the
+    session found. `drop_surface=True` simulates a session that removed `surface/`.
+    """
+
+    def __init__(
+        self,
+        edit: dict[str, str],
+        audit_dir: Path | None = None,
+        drop_surface: bool = False,
+    ) -> None:
+        super().__init__(ChannelSpec("claude_cli", ""), audit_dir=audit_dir)
+        self.edit = edit
+        self.drop_surface = drop_surface
+        self.seen: dict[str, bytes] = {}
+
+    def _claude_cli(self, cwd: Path, mission: str, system: str, wall: int):
+        context = cwd / "context"
+        for path in context.rglob("*"):
+            if path.is_file():
+                self.seen[path.relative_to(context).as_posix()] = path.read_bytes()
+        if self.drop_surface:
+            shutil.rmtree(context / "surface", ignore_errors=True)
+        for key, text in self.edit.items():
+            target = context / key
+            target.parent.mkdir(parents=True, exist_ok=True)
+            with target.open("w", encoding="utf-8", newline="") as handle:
+                handle.write(text)
+        return "ok", 0.0, ""

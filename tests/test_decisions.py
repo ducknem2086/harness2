@@ -1,8 +1,14 @@
-"""Tests for the decision service client (harness jobs API)."""
+"""Tests for the decision worker: service client, routing surface, proposer sessions."""
 
 import copy
+import os
+import shutil
+import tempfile
 import unittest
+from pathlib import Path
+from unittest.mock import patch
 
+from harness2.core.proposer import ProposerError
 from harness2.decisions.client import (
     CandidateInvalid,
     DecisionClient,
@@ -10,8 +16,9 @@ from harness2.decisions.client import (
     LeaseLost,
     ServiceError,
 )
+from harness2.decisions.proposer import MISSION, make_proposer, propose
 from harness2.decisions.surface import apply_files, changed, context_files, editable_files
-from tests.decisions_fakes import FakeDecisionService, payload
+from tests.decisions_fakes import FakeDecisionService, FakeProposer, payload
 
 
 class ClientTests(unittest.TestCase):
@@ -279,6 +286,69 @@ class SurfaceTests(unittest.TestCase):
             ["routing instructions", "choice codex description"],
         )
         self.assertEqual(changed(self.questions, self.questions, self.routing), [])
+
+
+class ProposerTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp(prefix="decisions-test-"))
+        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
+
+    def test_local_env_has_no_vertex_variables(self):
+        leaked = {
+            "CLAUDE_CODE_USE_VERTEX": "1",
+            "ANTHROPIC_VERTEX_PROJECT_ID": "p",
+            "CLOUD_ML_REGION": "r",
+            "ANTHROPIC_API_KEY": "k",
+        }
+        with patch.dict(os.environ, leaked):
+            os.environ.pop("ANTHROPIC_MODEL", None)
+            env = make_proposer("", self.tmp).env()
+        for name in (*leaked, "ANTHROPIC_MODEL"):
+            self.assertNotIn(name, env)
+
+    def test_model_override_sets_anthropic_model(self):
+        env = make_proposer("claude-opus-5-5", self.tmp).env()
+        self.assertEqual(env["ANTHROPIC_MODEL"], "claude-opus-5-5")
+        self.assertNotIn("CLAUDE_CODE_USE_VERTEX", env)
+
+    def test_make_proposer_uses_claude_cli_channel_settings(self):
+        proposer = make_proposer("", self.tmp, effort="low", timeout=60)
+        self.assertEqual(proposer.spec.kind, "claude_cli")
+        self.assertEqual((proposer.spec.effort, proposer.spec.timeout), ("low", 60))
+        self.assertEqual(proposer.audit_dir, self.tmp)
+
+    def test_propose_returns_edited_surface_files(self):
+        proposer = FakeProposer(edit={"surface/routing.md": "mới"}, audit_dir=self.tmp)
+        out = propose(proposer, {"surface/routing.md": "cũ", "brief/failures.md": "x"}, MISSION, "c1")
+        self.assertEqual(out["surface/routing.md"], "mới")
+        self.assertNotIn("brief/failures.md", out)
+
+    def test_propose_gives_the_session_every_context_file(self):
+        proposer = FakeProposer(edit={}, audit_dir=self.tmp)
+        files = {"surface/choices/claude.md": "a", "brief/failures.md": "b"}
+        out = propose(proposer, files, MISSION, "c1")
+        self.assertEqual(set(proposer.seen), set(files))
+        self.assertEqual(out, {"surface/choices/claude.md": "a"})
+
+    def test_propose_keeps_newlines_as_written(self):
+        text = "line one\nline two\n\nline four\n"
+        proposer = FakeProposer(edit={"surface/routing.md": text}, audit_dir=self.tmp)
+        files = {"surface/routing.md": text, "brief/failures.md": text}
+        out = propose(proposer, files, MISSION, "c1")
+        self.assertEqual(out["surface/routing.md"], text)
+        self.assertNotIn("\r", out["surface/routing.md"])
+        self.assertEqual(set(proposer.seen), set(files))
+        for data in proposer.seen.values():
+            self.assertNotIn(b"\r", data)
+
+    def test_propose_without_workspace_raises(self):
+        proposer = FakeProposer(edit={}, audit_dir=self.tmp, drop_surface=True)
+        with self.assertRaises(ProposerError):
+            propose(proposer, {"surface/routing.md": "x"}, MISSION, "c1")
+
+    def test_mission_names_the_rules(self):
+        for needle in ("context/surface/", "context/brief/", "failures.md"):
+            self.assertIn(needle, MISSION)
 
 
 if __name__ == "__main__":
