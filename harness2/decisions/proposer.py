@@ -8,10 +8,12 @@ so `LocalClaudeProposer` never sets a Vertex variable.
 from __future__ import annotations
 
 import os
+import shutil
+import subprocess
 import tempfile
 from pathlib import Path
 
-from harness2.core.proposer import _DROP_ENV, Proposer, ProposerError
+from harness2.core.proposer import _DROP_ENV, SYSTEM_ARG_MAX, Proposer, ProposerError, _parse_json
 from harness2.core.spec import ChannelSpec
 
 _VERTEX_ENV = (
@@ -43,6 +45,9 @@ Rules:
   `context/surface/`.
 - Write plain text only. Keep each file a description of when to pick that
   provider, not a list of the test inputs.
+- Each file must not start or end with blank space or a blank line (it is
+  trimmed before use). Every `surface/choices/<value>.md` must be a single line:
+  no line breaks inside it. `surface/routing.md` may span several lines.
 - When you are done, reply with one short paragraph saying what you changed and why.
 """
 
@@ -59,6 +64,53 @@ class LocalClaudeProposer(Proposer):
         if self.spec.model.strip():
             env["ANTHROPIC_MODEL"] = self.spec.model
         return env
+
+    def _claude_cli(self, cwd: Path, mission: str, system: str, wall: int):
+        """The core session, except that the CLI's output is decoded as UTF-8.
+
+        The core runs `subprocess.run(text=True)`, which decodes with the locale. On a
+        Windows code page a Vietnamese reply then fails to decode and the session
+        comes back empty.
+        """
+        cmd = [
+            shutil.which("claude") or "claude",
+            "--dangerously-skip-permissions",
+            "-p",
+            "--output-format",
+            "json",
+            "--effort",
+            self.spec.effort,
+        ]
+        stdin = mission
+        if system:
+            if len(system) > SYSTEM_ARG_MAX:
+                stdin = f"# SYSTEM INSTRUCTIONS\n\n{system}\n\n# END\n\n{mission}"
+                cmd += [
+                    "--append-system-prompt",
+                    "Follow the SYSTEM INSTRUCTIONS block at the top of the message.",
+                ]
+            else:
+                cmd += ["--append-system-prompt", system]
+        p = subprocess.run(
+            cmd,
+            input=stdin,
+            cwd=cwd,
+            env=self.env(),
+            encoding="utf-8",
+            errors="replace",
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=wall,
+        )
+        payload = _parse_json(p.stdout)
+        text = str(payload.get("result") or payload.get("text") or "")
+        err = ""
+        if payload.get("is_error") or payload.get("subtype") not in (None, "success"):
+            err = f"CLI error: {payload.get('subtype')} {text[:200]}"
+            text = ""
+        elif p.returncode != 0 and not text.strip():
+            err = f"rc={p.returncode}: {(p.stderr or '')[-300:]}"
+        return text, float(payload.get("total_cost_usd") or 0.0), err
 
 
 def make_proposer(

@@ -16,6 +16,11 @@ from harness2.decisions.client import Evaluation
 ROUTING_KEY = "surface/routing.md"
 CHOICES_PREFIX = "surface/choices/"
 _SAFE_VALUE = re.compile(r"^[A-Za-z0-9._-]+$")
+# What JavaScript's String.prototype.trim removes, which is how the service checks the text.
+_JS_WHITESPACE = "\t\n\v\f\r " + "".join(
+    chr(code)
+    for code in (0xA0, 0x1680, *range(0x2000, 0x200B), 0x2028, 0x2029, 0x202F, 0x205F, 0x3000, 0xFEFF)
+)
 
 
 def editable_files(payload: dict) -> dict[str, str]:
@@ -63,20 +68,30 @@ def apply_files(questions: list[dict], routing: str, files: dict[str, str]) -> l
             problems.append(f"unknown file {key}")
     originals = {ROUTING_KEY: question.get("instructions", "")}
     originals.update({f"{CHOICES_PREFIX}{v}.md": c.get("description", "") for v, c in choices.items()})
+    texts: dict[str, str] = {}
     for key in sorted(expected_keys & files.keys()):
         text = files[key]
         if text == originals[key]:
-            continue  # untouched text is always accepted, even if it would not be valid as an edit
-        if not isinstance(text, str) or not text.strip():
+            texts[key] = text  # untouched text is always accepted, even if it would not be valid as an edit
+            continue
+        if not isinstance(text, str):
+            problems.append(f"{key} is not text")
+            continue
+        # The service requires text with no leading or trailing whitespace.
+        text = text.strip(_JS_WHITESPACE)
+        if not text:
             problems.append(f"{key} is empty")
         elif "\r" in text or "\x00" in text:
             problems.append(f"{key} contains a CR or NUL character")
+        elif key.startswith(CHOICES_PREFIX) and "\n" in text:
+            problems.append(f"{key} must be a single line (a choice description cannot contain a newline)")
+        texts[key] = text
     if problems:
         raise ValueError("; ".join(problems))
 
-    question["instructions"] = files[ROUTING_KEY]
+    question["instructions"] = texts[ROUTING_KEY]
     for value, choice in choices.items():
-        choice["description"] = files[f"{CHOICES_PREFIX}{value}.md"]
+        choice["description"] = texts[f"{CHOICES_PREFIX}{value}.md"]
     return result
 
 

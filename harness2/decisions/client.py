@@ -8,6 +8,11 @@ import urllib.error
 import urllib.request
 from dataclasses import dataclass
 
+# Scoring runs every test case through a single-worker engine and can take many minutes.
+SCORING_TIMEOUT = 1800.0
+# The service rejects a failure reason longer than 4000 characters.
+MAX_REASON = 3900
+
 
 @dataclass(frozen=True)
 class Job:
@@ -35,14 +40,39 @@ class CandidateInvalid(Exception):
 
 
 class ServiceError(Exception):
-    """Network failure, 5xx, or a response the client cannot interpret."""
+    """Network failure, 5xx, or a response the client cannot interpret.
+
+    When the service answered with an error, `status` and `code` (its `error` field)
+    say what it was; both are None for a network failure.
+    """
+
+    def __init__(self, message: str, *, status: int | None = None, code: str | None = None):
+        super().__init__(message)
+        self.status = status
+        self.code = code
+
+
+class EngineError(ServiceError):
+    """The service could not score a candidate (502 engine-error); the service itself is up."""
+
+    def __init__(self, message: str, *, status: int | None = 502):
+        super().__init__(message, status=status, code="engine-error")
 
 
 class DecisionClient:
-    def __init__(self, base_url: str, worker: str, timeout: float = 120.0):
+    def __init__(
+        self,
+        base_url: str,
+        worker: str,
+        timeout: float = 120.0,
+        scoring_timeout: float = SCORING_TIMEOUT,
+    ):
+        """`timeout` covers the quick calls; `evaluate` and `succeed` score every test case
+        one after another on the service, so they get `scoring_timeout`."""
         self.base_url = base_url.rstrip("/")
         self.worker = worker
         self.timeout = timeout
+        self.scoring_timeout = scoring_timeout
 
     def claim(self) -> Job | None:
         status, body = self._post("/api/harness/jobs/claim", {"worker": self.worker})
@@ -61,6 +91,7 @@ class DecisionClient:
         _, body = self._post(
             "/api/harness/evaluate",
             {"jobId": job_id, "worker": self.worker, "questions": questions},
+            timeout=self.scoring_timeout,
         )
         return Evaluation(
             accuracy=float(self._field(body, "accuracy")),
@@ -71,6 +102,7 @@ class DecisionClient:
         _, body = self._post(
             f"/api/harness/jobs/{job_id}/result",
             {"worker": self.worker, "outcome": "succeeded", "questions": questions, "report": report},
+            timeout=self.scoring_timeout,
         )
         return int(self._field(body, "version"))
 
@@ -83,7 +115,7 @@ class DecisionClient:
     def fail(self, job_id: str, reason: str) -> None:
         self._post(
             f"/api/harness/jobs/{job_id}/result",
-            {"worker": self.worker, "outcome": "failed", "reason": reason},
+            {"worker": self.worker, "outcome": "failed", "reason": reason[:MAX_REASON]},
         )
 
     @staticmethod
@@ -93,7 +125,7 @@ class DecisionClient:
         except (KeyError, TypeError) as exc:
             raise ServiceError(f"response is missing {key!r}: {body!r}") from exc
 
-    def _post(self, path: str, body: dict) -> tuple[int, dict]:
+    def _post(self, path: str, body: dict, timeout: float | None = None) -> tuple[int, dict]:
         request = urllib.request.Request(
             self.base_url + path,
             data=json.dumps(body).encode("utf-8"),
@@ -101,7 +133,9 @@ class DecisionClient:
             method="POST",
         )
         try:
-            with urllib.request.urlopen(request, timeout=self.timeout) as response:
+            with urllib.request.urlopen(
+                request, timeout=self.timeout if timeout is None else timeout
+            ) as response:
                 return response.status, self._decode(response.read())
         except urllib.error.HTTPError as exc:
             try:
@@ -135,4 +169,8 @@ class DecisionClient:
             raise LeaseLost(error)
         if status == 400 and error == "candidate-invalid":
             raise CandidateInvalid(str(body.get("detail", "")))
-        raise ServiceError(f"HTTP {status}: {body!r}")
+        if status == 502 and error == "engine-error":
+            raise EngineError(f"engine-error: {body.get('detail', '')}")
+        raise ServiceError(
+            f"HTTP {status}: {body!r}", status=status, code=error if isinstance(error, str) else None
+        )

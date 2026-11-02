@@ -16,6 +16,102 @@ from harness2.decisions.proposer import LocalClaudeProposer
 
 LEASE_UNTIL = "2099-01-01T00:00:00.000Z"
 
+# What JavaScript's trim() removes; the real service compares text against its trimmed self.
+_JS_SPACE = "\t\n\v\f\r " + "".join(
+    chr(code)
+    for code in (0xA0, 0x1680, *range(0x2000, 0x200B), 0x2028, 0x2029, 0x202F, 0x205F, 0x3000, 0xFEFF)
+)
+_IDENTIFIER = re.compile(r"^[a-zA-Z0-9_]{1,64}$")
+_LIST_KEY = {"predicate": None, "choice": "choices", "score": "levels"}
+_LABEL_KEY = {"choices": "value", "levels": "label"}
+
+
+def _text_problem(value: object, *, single_line: bool, required: bool) -> str | None:
+    """Why the real service refuses a text field (scenarioTransfer.ts), or None."""
+    if not isinstance(value, str):
+        return "must be a string"
+    if "\r" in value or "\x00" in value:
+        return "must not contain CR or NUL"
+    if value != value.strip(_JS_SPACE):
+        return "must not start or end with whitespace"
+    if required and not value:
+        return "must not be empty"
+    if single_line and "\n" in value:
+        return "must be a single line"
+    return None
+
+
+def _question_problem(question: object) -> str | None:
+    """Structural rules of the service's `questionSchema(false)`."""
+    if not isinstance(question, dict):
+        return "must be an object"
+    kind = question.get("type")
+    if kind not in _LIST_KEY:
+        return "type: must be predicate, choice or score"
+    list_key = _LIST_KEY[kind]
+    allowed = {"name", "type", "instructions"} | ({list_key} if list_key else set())
+    if set(question) - allowed:
+        return f"unexpected keys {sorted(set(question) - allowed)}"
+    name = question.get("name")
+    if not isinstance(name, str) or not _IDENTIFIER.match(name):
+        return "name: invalid identifier"
+    problem = _text_problem(question.get("instructions"), single_line=False, required=True)
+    if problem:
+        return f"instructions: {problem}"
+    if list_key is None:
+        return None
+    items = question.get(list_key)
+    if not isinstance(items, list) or len(items) < 2:
+        return f"{list_key}: need at least 2"
+    label = _LABEL_KEY[list_key]
+    for position, item in enumerate(items):
+        at = f"{list_key}.{position}"
+        if not isinstance(item, dict) or label not in item or set(item) - {label, "description"}:
+            return f"{at}: must have {label} and optionally description"
+        problem = _text_problem(item[label], single_line=True, required=True)
+        if problem:
+            return f"{at}.{label}: {problem}"
+        problem = _text_problem(item.get("description", ""), single_line=True, required=False)
+        if problem:
+            return f"{at}.description: {problem}"
+    return None
+
+
+def check_candidate(base_questions: list[dict], routing: str, raw: object) -> str | None:
+    """Mirror of the service's `checkCandidate`: None when acceptable, else the detail."""
+    if not isinstance(raw, list) or not 1 <= len(raw) <= 400:
+        return "questions: need between 1 and 400 questions"
+    # The service ignores thresholds, so a worker's copy may omit them.
+    questions = [
+        {k: v for k, v in q.items() if k != "threshold"} if isinstance(q, dict) else q for q in raw
+    ]
+    for index, question in enumerate(questions):
+        problem = _question_problem(question)
+        if problem:
+            return f"{index}.{problem}"
+    routing_questions = [q for q in questions if q["name"] == routing]
+    if len(routing_questions) != 1:
+        return f"need exactly one routing question {routing!r}"
+    if routing_questions[0]["type"] != "choice":
+        return "the routing question must stay type choice"
+    values = [c["value"] for c in routing_questions[0]["choices"]]
+    base_routing = next(q for q in base_questions if q.get("name") == routing)
+    if len(set(values)) != len(values) or sorted(values) != sorted(
+        c["value"] for c in base_routing["choices"]
+    ):
+        return "the routing question's choice values must stay the same"
+
+    def others(question_list: list[dict]) -> list[dict]:
+        return [
+            {k: v for k, v in q.items() if k != "threshold"}
+            for q in question_list
+            if q.get("name") != routing
+        ]
+
+    if others(questions) != others(base_questions):
+        return "the other questions must stay the same"
+    return None
+
 
 def payload(**overrides) -> dict:
     """A claim payload shaped like spec §7.1. Keyword overrides replace top-level keys."""
@@ -37,7 +133,15 @@ def payload(**overrides) -> dict:
                         {"value": "codex", "description": "Fast code generation."},
                     ],
                 },
-                {"name": "confidence", "type": "number", "instructions": "How sure are you, 0 to 1."},
+                {
+                    "name": "confidence",
+                    "type": "score",
+                    "instructions": "How sure are you.",
+                    "levels": [
+                        {"label": "low", "description": "Mostly guessing."},
+                        {"label": "high", "description": ""},
+                    ],
+                },
             ],
         },
         "testCases": [
@@ -101,7 +205,12 @@ class FakeDecisionService:
 
     `answers(questions, test_case)` decides each test case's `actual`.
     `results` records the body of every accepted `result` call.
-    `invalid_detail` (when set) makes `evaluate` answer 400 candidate-invalid.
+    `evaluate` and a `succeeded` result check the candidate like the service's
+    `checkCandidate` (trimmed text, single-line descriptions, same choice values, other
+    questions unchanged) and answer 400 candidate-invalid; a `succeeded` result is also
+    scored again and answers 400 no-improvement-as-success unless it beats the baseline.
+    `invalid_detail` (when set) makes both answer 400 candidate-invalid regardless.
+    `engine_error` makes both answer 502 engine-error after the checks.
     `server_error` makes every call answer 500.
     """
 
@@ -110,6 +219,7 @@ class FakeDecisionService:
         self.results: list[dict] = []
         self.invalid_detail: str | None = None
         self.server_error = False
+        self.engine_error = False
         self._lock = threading.Lock()
         self._queue: list[str] = []
         self._payloads: dict[str, dict] = {}
@@ -204,8 +314,9 @@ class FakeDecisionService:
                 job_id = body.get("jobId")
                 if not self._owns(job_id, worker):
                     return 409, {"error": "lease-lost"}
-                if self.invalid_detail is not None:
-                    return 400, {"error": "candidate-invalid", "detail": self.invalid_detail}
+                rejected = self._reject(job_id, body.get("questions"))
+                if rejected is not None:
+                    return rejected
                 return 200, self._evaluate(job_id, body.get("questions", []))
             match = re.fullmatch(r"/api/harness/jobs/([^/]+)/(heartbeat|result)", path)
             if match:
@@ -214,8 +325,28 @@ class FakeDecisionService:
                     return 409, {"error": "lease-lost"}
                 if action == "heartbeat":
                     return 200, {"leaseUntil": LEASE_UNTIL}
+                if body.get("outcome") == "succeeded":
+                    rejected = self._reject(job_id, body.get("questions"))
+                    if rejected is not None:
+                        return rejected
+                    # Like the service, score the winner again before publishing it.
+                    scored = self._evaluate(job_id, body["questions"])
+                    if not scored["accuracy"] > self._payloads[job_id]["baseline"]["accuracy"]:
+                        return 400, {"error": "no-improvement-as-success"}
                 return 200, self._record_result(job_id, body)
         return 404, {"error": "not-found"}
+
+    def _reject(self, job_id: str, questions: object) -> tuple[int, dict] | None:
+        """The 400 or 502 the service would answer for these questions, else None."""
+        if self.invalid_detail is not None:
+            return 400, {"error": "candidate-invalid", "detail": self.invalid_detail}
+        payload = self._payloads[job_id]
+        detail = check_candidate(payload["decisions"]["questions"], payload["routingQuestion"], questions)
+        if detail is not None:
+            return 400, {"error": "candidate-invalid", "detail": detail}
+        if self.engine_error:
+            return 502, {"error": "engine-error", "detail": "the engine is down"}
+        return None
 
     def _owns(self, job_id: str | None, worker: str | None) -> bool:
         return (

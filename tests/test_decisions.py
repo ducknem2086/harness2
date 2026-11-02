@@ -7,10 +7,12 @@ import json
 import os
 import shutil
 import socket
+import subprocess
 import tempfile
 import threading
 import time
 import unittest
+import urllib.error
 from pathlib import Path
 from unittest.mock import patch
 
@@ -20,15 +22,16 @@ from harness2.core.proposer import ProposerError
 from harness2.decisions.client import (
     CandidateInvalid,
     DecisionClient,
+    EngineError,
     Evaluation,
     LeaseLost,
     ServiceError,
 )
-from harness2.decisions.improve import improve
+from harness2.decisions.improve import improve, record
 from harness2.decisions.library import ExperienceLibrary
 from harness2.decisions.proposer import MISSION, make_proposer, propose
 from harness2.decisions.surface import apply_files, changed, context_files, editable_files
-from tests.decisions_fakes import FakeDecisionService, FakeProposer, payload
+from tests.decisions_fakes import FakeDecisionService, FakeProposer, check_candidate, payload
 
 
 class ClientTests(unittest.TestCase):
@@ -144,6 +147,144 @@ class ClientTests(unittest.TestCase):
         svc.stop()
         with self.assertRaises(ServiceError):
             DecisionClient(url, "w1", timeout=2).claim()
+
+    def test_error_answers_expose_status_and_code(self):
+        with FakeDecisionService() as svc:
+            svc.server_error = True
+            with self.assertRaises(ServiceError) as caught:
+                DecisionClient(svc.url, "w1").claim()
+        self.assertEqual((caught.exception.status, caught.exception.code), (500, "boom"))
+
+    def test_network_failure_has_no_status_or_code(self):
+        svc = FakeDecisionService().start()
+        url = svc.url
+        svc.stop()
+        with self.assertRaises(ServiceError) as caught:
+            DecisionClient(url, "w1", timeout=2).claim()
+        self.assertEqual((caught.exception.status, caught.exception.code), (None, None))
+
+    def test_engine_error_is_its_own_exception(self):
+        with FakeDecisionService() as svc:
+            svc.queue(payload())
+            client = DecisionClient(svc.url, "w1")
+            job = client.claim()
+            svc.engine_error = True
+            with self.assertRaises(EngineError) as caught:
+                client.evaluate(job.id, job.payload["decisions"]["questions"])
+            self.assertIn("the engine is down", str(caught.exception))
+            self.assertEqual(caught.exception.code, "engine-error")
+            with self.assertRaises(ServiceError):  # still a ServiceError for callers that do not care
+                client.succeed(job.id, job.payload["decisions"]["questions"], {})
+
+    def test_succeeding_without_beating_the_baseline_is_rejected_with_its_code(self):
+        with FakeDecisionService() as svc:
+            svc.queue(payload())
+            client = DecisionClient(svc.url, "w1")
+            job = client.claim()
+            svc.answers = lambda questions, case: "nowhere"
+            with self.assertRaises(ServiceError) as caught:
+                client.succeed(job.id, job.payload["decisions"]["questions"], {})
+            self.assertEqual((caught.exception.status, caught.exception.code), (400, "no-improvement-as-success"))
+            self.assertEqual(svc.results, [])
+
+    def test_only_scoring_calls_get_the_long_timeout(self):
+        seen: dict[str, float] = {}
+        bodies = {
+            "claim": {"jobId": "j", "leaseUntil": "t", "payload": {}},
+            "heartbeat": {"leaseUntil": "t"},
+            "evaluate": {"accuracy": 1.0, "results": []},
+            "result": {"version": 2},
+        }
+
+        class Response:
+            status = 200
+
+            def __init__(self, body):
+                self.body = body
+
+            def read(self):
+                return json.dumps(self.body).encode()
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *exc_info):
+                return False
+
+        def fake_urlopen(request, timeout=None):
+            seen[request.full_url.rsplit("/", 1)[-1] + ":" + json.loads(request.data).get("outcome", "")] = timeout
+            name = request.full_url.rsplit("/", 1)[-1]
+            return Response(bodies.get(name, {}))
+
+        client = DecisionClient("http://x", "w1", timeout=7, scoring_timeout=99)
+        with patch("harness2.decisions.client.urllib.request.urlopen", fake_urlopen):
+            client.claim()
+            client.heartbeat("j")
+            client.evaluate("j", [])
+            client.succeed("j", [], {})
+            client.no_improvement("j", {})
+            client.fail("j", "why")
+        self.assertEqual(
+            seen,
+            {
+                "claim:": 7,
+                "heartbeat:": 7,
+                "evaluate:": 99,
+                "result:succeeded": 99,
+                "result:no-improvement": 7,
+                "result:failed": 7,
+            },
+        )
+        self.assertEqual(DecisionClient("http://x", "w1").scoring_timeout, 1800.0)
+
+    def test_failure_reason_is_cut_to_what_the_service_accepts(self):
+        sent = []
+
+        def fake_urlopen(request, timeout=None):
+            sent.append(json.loads(request.data))
+            raise urllib.error.URLError("stop here")
+
+        with patch("harness2.decisions.client.urllib.request.urlopen", fake_urlopen):
+            with self.assertRaises(ServiceError):
+                DecisionClient("http://x", "w1").fail("j", "x" * 10_000)
+        self.assertEqual(len(sent[0]["reason"]), 3900)
+
+    def test_fake_service_refuses_what_the_real_one_refuses(self):
+        with FakeDecisionService() as svc:
+            svc.queue(payload())
+            client = DecisionClient(svc.url, "w1")
+            job = client.claim()
+            original = job.payload["decisions"]["questions"]
+
+            def edited(change):
+                questions = copy.deepcopy(original)
+                change(questions)
+                return questions
+
+            def set_instructions(text):
+                return lambda qs: qs[0].__setitem__("instructions", text)
+
+            def set_description(text):
+                return lambda qs: qs[0]["choices"][0].__setitem__("description", text)
+
+            cases = {
+                "trailing newline in instructions": edited(set_instructions("Pick one.\n")),
+                "leading space in instructions": edited(set_instructions(" Pick one.")),
+                "multi-line description": edited(set_description("one\ntwo")),
+                "trailing newline in description": edited(set_description("one\n")),
+                "changed choice value": edited(lambda qs: qs[0]["choices"][0].__setitem__("value", "x")),
+                "dropped choice": edited(lambda qs: qs[0]["choices"].pop()),
+                "changed other question": edited(lambda qs: qs[1].__setitem__("instructions", "Other.")),
+            }
+            for name, questions in cases.items():
+                with self.subTest(name):
+                    with self.assertRaises(CandidateInvalid):
+                        client.evaluate(job.id, questions)
+                    with self.assertRaises(CandidateInvalid):
+                        client.succeed(job.id, questions, {})
+            # Trimmed text, a multi-line instruction and omitted thresholds are all fine.
+            fine = edited(set_instructions("Line one.\nLine two."))
+            self.assertEqual(len(client.evaluate(job.id, fine).results), 2)
 
     def test_response_cut_short_raises_service_error(self):
         # The service dies mid-response: urllib raises http.client.IncompleteRead, which is
@@ -265,6 +406,62 @@ class SurfaceTests(unittest.TestCase):
                     p["decisions"]["questions"],
                 )
 
+    def test_edited_text_is_trimmed_like_the_service_requires(self):
+        edits = {
+            "surface/routing.md": "\n  Route by task type.\n\n",
+            "surface/choices/claude.md": "Brainstorm and review.\n",
+            "surface/choices/codex.md": "\u00a0Quick scripts.\u3000\ufeff",
+        }
+        out = apply_files(self.questions, self.routing, editable_files(self.p) | edits)
+        routing = next(q for q in out if q["name"] == self.routing)
+        self.assertEqual(routing["instructions"], "Route by task type.")
+        self.assertEqual(
+            [c["description"] for c in routing["choices"]], ["Brainstorm and review.", "Quick scripts."]
+        )
+        self.assertIsNone(check_candidate(self.questions, self.routing, out))
+
+    def test_multi_line_routing_instructions_are_allowed(self):
+        files = editable_files(self.p) | {"surface/routing.md": "First rule.\nSecond rule."}
+        out = apply_files(self.questions, self.routing, files)
+        self.assertEqual(out[0]["instructions"], "First rule.\nSecond rule.")
+        self.assertIsNone(check_candidate(self.questions, self.routing, out))
+
+    def test_multi_line_choice_description_is_rejected_locally(self):
+        for bad in ("one\ntwo", "one\n\ntwo", "  one\ntwo  "):
+            with self.subTest(bad=bad):
+                files = editable_files(self.p) | {"surface/choices/claude.md": bad}
+                with self.assertRaisesRegex(ValueError, r"choices/claude\.md must be a single line"):
+                    apply_files(self.questions, self.routing, files)
+
+    def test_unedited_multi_line_description_is_accepted(self):
+        p = payload()
+        p["decisions"]["questions"][0]["choices"][0]["description"] = "one\ntwo "
+        files = editable_files(p)
+        self.assertEqual(
+            apply_files(p["decisions"]["questions"], p["routingQuestion"], files),
+            p["decisions"]["questions"],
+        )
+
+    def test_the_service_mirror_rejects_untrimmed_and_multi_line_text(self):
+        # Guards the fake: it must refuse what the real service refuses.
+        for path, text in (
+            ("instructions", "ends with a newline\n"),
+            ("instructions", " starts with a space"),
+            ("description", "ends with a newline\n"),
+            ("description", "two\nlines"),
+        ):
+            with self.subTest(path=path, text=text):
+                questions = copy.deepcopy(self.questions)
+                if path == "instructions":
+                    questions[0]["instructions"] = text
+                else:
+                    questions[0]["choices"][0]["description"] = text
+                self.assertIsNotNone(check_candidate(self.questions, self.routing, questions))
+
+    def test_mission_states_the_trim_and_single_line_rules(self):
+        self.assertIn("single line", MISSION)
+        self.assertIn("blank space", MISSION)
+
     def test_editing_an_empty_original_is_still_checked(self):
         p = payload()
         p["decisions"]["questions"][0]["choices"][0]["description"] = ""
@@ -365,6 +562,34 @@ class ProposerTests(unittest.TestCase):
         self.assertEqual(proposer.spec.kind, "claude_cli")
         self.assertEqual((proposer.spec.effort, proposer.spec.timeout), ("low", 60))
         self.assertEqual(proposer.audit_dir, self.tmp)
+
+    def run_cli_with(self, raw: bytes) -> tuple[str, float, str]:
+        """The proposer's CLI session against a fake `claude` that prints `raw` bytes.
+
+        Like `subprocess.run`, the fake decodes with the `encoding` it was asked for and with
+        the Windows ANSI code page when it was only asked for text mode.
+        """
+        seen = {}
+
+        def fake_run(cmd, **kwargs):
+            seen.update(kwargs)
+            text = raw.decode(kwargs.get("encoding") or "cp1252", kwargs.get("errors") or "strict")
+            return subprocess.CompletedProcess(cmd, 0, stdout=text, stderr="")
+
+        with patch("harness2.decisions.proposer.subprocess.run", fake_run):
+            result = make_proposer("", self.tmp)._claude_cli(self.tmp, "Sửa mô tả.", "", 5)
+        self.assertEqual((seen["encoding"], seen["errors"]), ("utf-8", "replace"))
+        return result
+
+    def test_vietnamese_reply_is_decoded_as_utf8(self):
+        reply = {"result": "Đã sửa: ưu tiên brainstorm ✓", "total_cost_usd": 0.25}
+        text, cost, err = self.run_cli_with(json.dumps(reply, ensure_ascii=False).encode("utf-8"))
+        self.assertEqual((text, cost, err), ("Đã sửa: ưu tiên brainstorm ✓", 0.25, ""))
+
+    def test_invalid_utf8_in_a_reply_is_replaced_not_fatal(self):
+        raw = b'{"result": "ok \xff done"}'
+        text, _, err = self.run_cli_with(raw)
+        self.assertEqual((text, err), ("ok \ufffd done", ""))
 
     def test_propose_returns_edited_surface_files(self):
         proposer = FakeProposer(edit={"surface/routing.md": "mới"}, audit_dir=self.tmp)
@@ -601,7 +826,9 @@ class ImproveTests(unittest.TestCase):
         self.assertEqual(self.library.notes("wf-1"), "")
 
     def test_library_notes_feed_the_next_job(self):
-        first = improve(self.claim(), self.client, self.proposer([STRONG, WEAK, WEAK]), self.library, k=2)
+        first_job = self.claim()
+        first = improve(first_job, self.client, self.proposer([STRONG, WEAK, WEAK]), self.library, k=2)
+        record(self.library, first_job, first)
         summary = first.report["summary"]
         self.assertIn(summary, self.library.notes("wf-1"))
         proposer = self.proposer([WEAK, WEAK, WEAK])
@@ -613,12 +840,61 @@ class ImproveTests(unittest.TestCase):
         improve(self.claim(), self.client, proposer, self.library, k=2)
         self.assertTrue(proposer.sessions[0]["brief/experience.md"].decode().strip())
 
-    def test_job_is_recorded_in_the_library(self):
+    def test_improve_leaves_recording_to_the_caller(self):
         job = self.claim()
-        improve(job, self.client, self.proposer([WEAK, WEAK, WEAK]), self.library, k=2)
+        outcome = improve(job, self.client, self.proposer([WEAK, WEAK, WEAK]), self.library, k=2)
+        self.assertEqual(self.library.notes("wf-1"), "")
+        record(self.library, job, outcome)
         notes = self.library.notes("wf-1")
         self.assertIn(job.id, notes)
         self.assertIn("no-improvement", notes)
+
+    def test_record_files_the_lesson_under_the_accepted_outcome(self):
+        job = self.claim()
+        outcome = improve(job, self.client, self.proposer([WEAK, STRONG, WEAK, STRONG_AND_MORE]), self.library)
+        self.assertEqual(outcome.kind, "succeeded")
+        record(self.library, job, outcome, "no-improvement")
+        notes = self.library.notes("wf-1")
+        self.assertRegex(notes, rf"{job.id} .*: no-improvement,")
+        self.assertNotRegex(notes, rf"{job.id} .*: succeeded,")
+        self.assertIn("not succeeded", notes)
+
+    def test_engine_error_fails_only_that_candidate(self):
+        job = self.claim()
+        proposer = self.proposer([WEAK, STRONG])
+        original = proposer._claude_cli
+
+        def engine_down_for_the_first_session(cwd, mission, system, wall):
+            self.svc.engine_error = len(proposer.sessions) == 0
+            return original(cwd, mission, system, wall)
+
+        proposer._claude_cli = engine_down_for_the_first_session
+        outcome = improve(job, self.client, proposer, self.library, k=2)
+        self.assertEqual(outcome.kind, "succeeded")
+        first, second = outcome.report["candidates"]
+        self.assertIn("could not score", first["error"])
+        self.assertIsNone(first["accuracy"])
+        self.assertEqual((second["error"], second["accuracy"]), (None, 1.0))
+
+    def test_engine_error_on_every_candidate_is_no_improvement(self):
+        job = self.claim()
+        self.svc.engine_error = True
+        outcome = improve(job, self.client, self.proposer([WEAK, STRONG]), self.library, k=2)
+        self.assertEqual(outcome.kind, "no-improvement")
+        self.assertTrue(all("could not score" in c["error"] for c in outcome.report["candidates"]))
+
+    def test_a_dead_service_is_not_an_engine_error(self):
+        job = self.claim()
+        proposer = self.proposer([STRONG, STRONG])
+        original = proposer._claude_cli
+
+        def die(cwd, mission, system, wall):
+            self.svc.stop()
+            return original(cwd, mission, system, wall)
+
+        proposer._claude_cli = die
+        with self.assertRaises(ServiceError):
+            improve(job, self.client, proposer, self.library, k=2)
 
 
 class ExperienceLibraryTests(unittest.TestCase):
@@ -690,6 +966,16 @@ class WorkerClient(DecisionClient):
         self.heartbeat_threads: list[threading.Thread] = []
         self.posted: list[str] = []
         self.thread_heartbeat_error: Exception | None = None
+        self.before_succeed = None  # runs just before the succeeded result is posted
+
+    def succeed(self, job_id, questions, report):
+        if self.before_succeed is not None:
+            self.before_succeed()
+        return self.post_succeed(job_id, questions, report)
+
+    def post_succeed(self, job_id, questions, report):
+        self.posted.append("succeed")
+        return super().succeed(job_id, questions, report)
 
     def heartbeat(self, job_id):
         thread = threading.current_thread()
@@ -697,10 +983,6 @@ class WorkerClient(DecisionClient):
         if self.thread_heartbeat_error is not None and thread is not threading.main_thread():
             raise self.thread_heartbeat_error
         return super().heartbeat(job_id)
-
-    def succeed(self, job_id, questions, report):
-        self.posted.append("succeed")
-        return super().succeed(job_id, questions, report)
 
     def no_improvement(self, job_id, report):
         self.posted.append("no_improvement")
@@ -801,6 +1083,82 @@ class WorkerTests(unittest.TestCase):
             outcome = decision_worker.run_once(client, self.proposer([]), self.library, 3)
         self.assertEqual(outcome, "idle")
 
+    def succeeded_run(self) -> str:
+        self.svc.queue(improve_payload())
+        return self.run_once(self.proposer([WEAK, STRONG, WEAK, STRONG_AND_MORE]))
+
+    def test_accepted_result_is_recorded_in_the_library(self):
+        self.assertEqual(self.succeeded_run(), "succeeded")
+        self.assertRegex(self.library.notes("wf-1"), r"job-1 .*: succeeded,")
+
+    def test_lesson_is_not_recorded_when_the_job_fails(self):
+        self.svc.queue(improve_payload())
+        with self.assertLogs(decision_worker.log, level="WARNING"):
+            self.run_once(self.proposer([WEAK], RaisingProposer))
+        self.assertEqual(self.library.notes("wf-1"), "")
+
+    def test_a_winner_the_service_rescores_as_no_better_becomes_no_improvement(self):
+        self.client.before_succeed = lambda: setattr(self.svc, "answers", lambda qs, case: "nowhere")
+        self.assertEqual(self.succeeded_run(), "no-improvement")
+        self.assertEqual(self.client.posted, ["succeed", "no_improvement"])
+        result = self.svc.results[-1]
+        self.assertEqual(result["outcome"], "no-improvement")
+        self.assertNotIn("questions", result)
+        self.assertIn("no-improvement-as-success", result["report"]["serviceRejection"])
+        self.assertIn("summary", result["report"])  # the original report is kept
+        notes = self.library.notes("wf-1")
+        self.assertRegex(notes, r"job-1 .*: no-improvement,")
+        self.assertNotRegex(notes, r"job-1 .*: succeeded,")
+
+    def test_engine_error_while_publishing_fails_the_job(self):
+        self.client.before_succeed = lambda: setattr(self.svc, "engine_error", True)
+        with self.assertLogs(decision_worker.log, level="WARNING"):
+            self.assertEqual(self.succeeded_run(), "failed")
+        self.assertEqual(self.client.posted, ["succeed", "fail"])
+        # The fake rejects every scoring call now, but a failed result needs none.
+        result = self.svc.results[-1]
+        self.assertEqual(result["outcome"], "failed")
+        self.assertIn("engine-error", result["reason"])
+        self.assertEqual(self.library.notes("wf-1"), "")
+
+    def test_service_outage_while_publishing_tries_to_fail_the_job(self):
+        self.client.before_succeed = self.svc.stop
+        with self.assertLogs(decision_worker.log, level="WARNING"):
+            self.assertEqual(self.succeeded_run(), "failed")
+        self.assertEqual(self.client.posted, ["succeed", "fail"])  # the fail call itself could not land
+        self.assertEqual(self.library.notes("wf-1"), "")
+
+    def test_a_server_error_while_publishing_fails_the_job(self):
+        def break_the_service_for_succeed_only():
+            self.svc.server_error = True
+            original = self.client.fail
+
+            def fail_after_recovery(job_id, reason):
+                self.svc.server_error = False
+                return original(job_id, reason)
+
+            self.client.fail = fail_after_recovery
+
+        self.client.before_succeed = break_the_service_for_succeed_only
+        with self.assertLogs(decision_worker.log, level="WARNING"):
+            self.assertEqual(self.succeeded_run(), "failed")
+        self.assertEqual(self.svc.results[-1]["outcome"], "failed")
+        self.assertIn("HTTP 500", self.svc.results[-1]["reason"])
+
+    def test_lease_lost_while_publishing_posts_nothing_more(self):
+        self.client.before_succeed = lambda: self.svc.lose_lease("job-1")
+        with self.assertLogs(decision_worker.log, level="WARNING"):
+            self.assertEqual(self.succeeded_run(), "lease-lost")
+        self.assertEqual(self.client.posted, ["succeed"])
+        self.assertEqual(self.svc.results, [])
+        self.assertEqual(self.library.notes("wf-1"), "")
+
+    def test_engine_error_on_every_candidate_is_no_improvement_not_failure(self):
+        self.svc.queue(improve_payload())
+        self.svc.engine_error = True
+        self.assertEqual(self.run_once(self.proposer([WEAK, STRONG, WEAK])), "no-improvement")
+        self.assertEqual(self.svc.results[-1]["outcome"], "no-improvement")
+
     def sleepy(self, proposer: FakeProposer, before=None, seconds: float = 0.4) -> None:
         original = proposer._claude_cli
 
@@ -869,6 +1227,26 @@ class WorkerMainTests(unittest.TestCase):
         self.assertEqual((args.k, args.model, args.poll_seconds, args.once), (3, "", 30, False))
         self.assertEqual(args.library_dir, config.RUNS / "decisions" / "library")
         self.assertEqual(args.audit_dir, config.RUNS / "decisions" / "audit")
+
+    def test_k_must_be_at_least_one(self):
+        for bad in ("0", "-2", "x"):
+            with self.subTest(k=bad), contextlib.redirect_stderr(io.StringIO()):
+                with self.assertRaises(SystemExit) as caught:
+                    decision_worker.build_parser().parse_args(["--k", bad])
+                self.assertEqual(caught.exception.code, 2)
+        self.assertEqual(decision_worker.build_parser().parse_args(["--k", "1"]).k, 1)
+
+    def test_http_timeout_defaults_to_the_scoring_timeout_and_reaches_the_client(self):
+        parser = decision_worker.build_parser()
+        self.assertEqual(parser.parse_args([]).http_timeout, 1800.0)
+        with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
+            parser.parse_args(["--http-timeout", "0"])
+        with (
+            patch.object(decision_worker, "run_once", side_effect=KeyboardInterrupt()),
+            patch.object(decision_worker, "DecisionClient", wraps=DecisionClient) as client_class,
+        ):
+            decision_worker.main(self.argv("http://127.0.0.1:9", "--http-timeout", "900"))
+        self.assertEqual(client_class.call_args.kwargs["scoring_timeout"], 900.0)
 
     def test_once_exits_zero_when_idle(self):
         with FakeDecisionService() as svc, contextlib.redirect_stdout(io.StringIO()) as out:

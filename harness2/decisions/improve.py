@@ -1,7 +1,9 @@
 """One harness job: propose routing text candidates, probe them, compose the best two.
 
-`improve` never posts a result; the caller (the worker) does that from the
-returned `Outcome`. `LeaseLost` and `ServiceError` from the client propagate.
+`improve` never posts a result or records a lesson; the caller (the worker) does
+both from the returned `Outcome`, once the service has accepted it. `LeaseLost` and
+`ServiceError` from the client propagate, except an `EngineError` while scoring one
+candidate, which only fails that candidate.
 """
 
 from __future__ import annotations
@@ -10,7 +12,13 @@ from dataclasses import dataclass
 from typing import Literal
 
 from harness2.core.proposer import Proposer, ProposerError
-from harness2.decisions.client import CandidateInvalid, DecisionClient, Evaluation, Job
+from harness2.decisions.client import (
+    CandidateInvalid,
+    DecisionClient,
+    EngineError,
+    Evaluation,
+    Job,
+)
 from harness2.decisions.library import ExperienceLibrary
 from harness2.decisions.proposer import MISSION, SURFACE_PREFIX, propose
 from harness2.decisions.surface import apply_files, changed, context_files, editable_files
@@ -36,6 +44,7 @@ class Outcome:
     kind: Literal["succeeded", "no-improvement"]
     questions: list[dict] | None
     report: dict
+    lesson: dict  # what `record` adds to the library once the service has taken the result
 
 
 @dataclass
@@ -87,6 +96,8 @@ def improve(
             candidate.evaluation = client.evaluate(job.id, candidate.questions)
         except CandidateInvalid as exc:
             candidate.error = f"rejected by the decision service: {exc.detail}"
+        except EngineError as exc:  # the service could not score this one; the others may still work
+            candidate.error = f"the decision service could not score it: {exc}"
         return candidate
 
     candidates = [attempt(f"{job.id}-p{i}", MISSION, {}) for i in range(k)]
@@ -103,21 +114,31 @@ def improve(
     best = min((c for c in candidates if c.evaluation is not None), key=_rank, default=None)
     report = _report(payload, baseline, candidates, best)
     improved = best is not None and best.accuracy > baseline
-    library.record(
-        key,
-        {
-            "jobId": job.id,
-            "baseVersion": payload.get("baseVersion"),
-            "baselineAccuracy": baseline,
-            "bestAccuracy": report["bestAccuracy"],
-            "outcome": "succeeded" if improved else "no-improvement",
-            "changes": report["changes"],
-            "summary": report["summary"],
-        },
-    )
+    lesson = {
+        "jobId": job.id,
+        "baseVersion": payload.get("baseVersion"),
+        "baselineAccuracy": baseline,
+        "bestAccuracy": report["bestAccuracy"],
+        "changes": report["changes"],
+        "summary": report["summary"],
+    }
     if improved:
-        return Outcome("succeeded", best.questions, report)
-    return Outcome("no-improvement", None, report)
+        return Outcome("succeeded", best.questions, report, lesson)
+    return Outcome("no-improvement", None, report, lesson)
+
+
+def record(library: ExperienceLibrary, job: Job, outcome: Outcome, accepted: str | None = None) -> None:
+    """Add the job's lesson to the library, under the outcome the service accepted.
+
+    The caller records only once the service has taken the result, so the library never
+    claims a version that was not created. `accepted` overrides `outcome.kind` when the
+    service ended the job differently from what `improve` proposed.
+    """
+    kind = accepted or outcome.kind
+    entry = {**outcome.lesson, "outcome": kind}
+    if kind != outcome.kind:
+        entry["summary"] += f" The service ended the job as {kind}, not {outcome.kind}."
+    library.record(job.payload["workflowKey"], entry)
 
 
 def _rank(candidate: _Candidate) -> tuple[float, int]:
