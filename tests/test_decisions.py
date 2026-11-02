@@ -341,6 +341,14 @@ class ProposerTests(unittest.TestCase):
         for data in proposer.seen.values():
             self.assertNotIn(b"\r", data)
 
+    def test_propose_normalises_harvested_line_endings(self):
+        raw = "a\r\nb\rc\n"
+        edit = {"surface/routing.md": raw, "surface/choices/claude.md": raw}
+        proposer = FakeProposer(edit=edit, audit_dir=self.tmp)
+        out = propose(proposer, {"surface/routing.md": "x"}, MISSION, "c1")
+        self.assertEqual(out["surface/routing.md"], "a\nb\nc\n")
+        self.assertEqual(out["surface/choices/claude.md"], "a\nb\nc\n")
+
     def test_propose_without_workspace_raises(self):
         proposer = FakeProposer(edit={}, audit_dir=self.tmp, drop_surface=True)
         with self.assertRaises(ProposerError):

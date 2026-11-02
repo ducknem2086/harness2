@@ -71,8 +71,10 @@ def make_proposer(
 def propose(proposer: Proposer, files: dict[str, str], mission: str, label: str) -> dict[str, str]:
     """Run one session over `files`; return the `surface/` files it left behind.
 
-    Files are written and read as raw UTF-8 with no newline translation, so a
-    candidate never gains the carriage returns that `apply_files` rejects.
+    Context files are written as raw UTF-8 with no newline translation. Harvested
+    files are read as UTF-8 and their line endings normalised to LF (CRLF and a
+    lone CR both become LF), because `apply_files` rejects carriage returns and a
+    CLI on Windows may write CRLF.
     """
     with tempfile.TemporaryDirectory(prefix="decisions-context-") as tmp:
         context = Path(tmp)
@@ -90,7 +92,8 @@ def propose(proposer: Proposer, files: dict[str, str], mission: str, label: str)
             continue
         key = SURFACE_PREFIX + path.relative_to(workspace).as_posix()
         try:
-            edited[key] = path.read_bytes().decode("utf-8")
+            text = path.read_bytes().decode("utf-8")
         except UnicodeDecodeError as exc:
             raise ProposerError(f"[{label}] {key} is not valid UTF-8: {exc}", attempts=reply.attempts) from exc
+        edited[key] = text.replace("\r\n", "\n").replace("\r", "\n")
     return edited
