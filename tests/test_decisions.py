@@ -988,9 +988,9 @@ class WorkerClient(DecisionClient):
         self.posted.append("no_improvement")
         return super().no_improvement(job_id, report)
 
-    def fail(self, job_id, reason):
+    def fail(self, job_id, reason, report=None):
         self.posted.append("fail")
-        return super().fail(job_id, reason)
+        return super().fail(job_id, reason, report)
 
 
 class RaisingProposer(FakeProposer):
@@ -1133,9 +1133,9 @@ class WorkerTests(unittest.TestCase):
             self.svc.server_error = True
             original = self.client.fail
 
-            def fail_after_recovery(job_id, reason):
+            def fail_after_recovery(job_id, reason, report=None):
                 self.svc.server_error = False
-                return original(job_id, reason)
+                return original(job_id, reason, report)
 
             self.client.fail = fail_after_recovery
 

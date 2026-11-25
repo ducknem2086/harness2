@@ -82,6 +82,7 @@ class Reply:
     error: str = ""
     audit: Path | None = None
     workspace: Path | None = None
+    attempt_details: list[dict] = field(default_factory=list)
 
     def __bool__(self) -> bool:
         return self.ok
@@ -97,6 +98,7 @@ class Proposer:
     project: str = field(default_factory=lambda: config.VERTEX_PROJECT)
     region: str = field(default_factory=lambda: config.VERTEX_REGION)
     _calls: list[Reply] = field(default_factory=list)
+    _process_state: threading.local = field(default_factory=threading.local, repr=False)
 
     def __post_init__(self) -> None:
         if not self.spec.model.strip():
@@ -146,22 +148,26 @@ class Proposer:
             self._calls.append(cached)
             return cached
 
+        self._write_inputs(label, cache_key, mission, system, context_dir)
         wall = int(timeout or self.spec.timeout)
         tries = max(1, int(self.attempts if max_attempts is None else max_attempts))
         last = ""
         spent_usd = 0.0
         t0 = time.time()
+        details: list[dict] = []
         for attempt in range(1, tries + 1):
             if attempt > 1:
                 time.sleep(10 * (attempt - 1))
             tmp = Path(tempfile.mkdtemp(prefix="harness2-prop-"))
+            attempt_started = time.time()
+            self._process_state.output = {}
+            text, cost, err = "", 0.0, ""
+            r = None
             try:
                 if context_dir and Path(context_dir).is_dir():
                     shutil.copytree(context_dir, tmp / "context", dirs_exist_ok=True)
                 with _SEM if _SEM is not None else contextlib.nullcontext():
-                    text, cost, err = (
-                        self._claude_cli if self.spec.kind == "claude_cli" else self._opencode
-                    )(tmp, mission, system, wall)
+                    text, cost, err = self._session(tmp, mission, system, wall)
                 spent_usd += cost
                 if not text.strip():
                     last = err or "empty reply"
@@ -174,20 +180,35 @@ class Proposer:
                     wall_s=round(time.time() - t0, 1),
                     attempts=attempt,
                     channel=self.spec.kind,
+                    attempt_details=details,
                 )
                 if harvest:
                     r.workspace = self._harvest(tmp, harvest, label, cache_key)
                     if r.workspace is None:
                         _drop_workspace(self._paths(label, cache_key))
+            except subprocess.TimeoutExpired:
+                last = f"timeout after {wall}s"
+                r = None
+            except Exception as exc:
+                last = f"{type(exc).__name__}: {exc}"
+                r = None
+            finally:
+                details.append({
+                    "attempt": attempt,
+                    "text": text,
+                    "error": err if r is not None else last,
+                    "cost_usd": cost,
+                    "wall_s": round(time.time() - attempt_started, 3),
+                    **self._process_state.output,
+                })
+                try:
+                    self._write_attempts(label, cache_key, details)
+                finally:
+                    shutil.rmtree(tmp, ignore_errors=True)
+            if r is not None:
                 self._write_audit(r, mission, system, cache_key)
                 self._calls.append(r)
                 return r
-            except subprocess.TimeoutExpired:
-                last = f"timeout after {wall}s"
-            except Exception as exc:
-                last = f"{type(exc).__name__}: {exc}"
-            finally:
-                shutil.rmtree(tmp, ignore_errors=True)
 
         r = Reply(
             label=label,
@@ -198,6 +219,7 @@ class Proposer:
             channel=self.spec.kind,
             error=last,
             cost_usd=spent_usd,
+            attempt_details=details,
         )
         self._calls.append(r)
         self._write_audit(r, mission, system, cache_key)
@@ -206,6 +228,32 @@ class Proposer:
             attempts=tries,
             cost_usd=spent_usd,
         )
+
+    def _session(self, cwd: Path, mission: str, system: str, wall: int) -> tuple[str, float, str]:
+        """Select the transport; local workers may supply additional channels."""
+        if self.spec.kind == "claude_cli":
+            return self._claude_cli(cwd, mission, system, wall)
+        if self.spec.kind == "opencode":
+            return self._opencode(cwd, mission, system, wall)
+        raise ValueError(f"No proposer transport for {self.spec.kind!r}")
+
+    def _run_process(self, cmd: list[str], **kwargs) -> subprocess.CompletedProcess:
+        """Keep complete process diagnostics, including output received before timeout."""
+        def decoded(value):
+            return value.decode("utf-8", errors="replace") if isinstance(value, bytes) else value or ""
+
+        try:
+            result = subprocess.run(cmd, **kwargs)
+        except subprocess.TimeoutExpired as exc:
+            self._process_state.output = {
+                "stdout": decoded(exc.stdout), "stderr": decoded(exc.stderr), "returncode": None,
+            }
+            raise
+        self._process_state.output = {
+            "stdout": decoded(result.stdout), "stderr": decoded(result.stderr),
+            "returncode": result.returncode,
+        }
+        return result
 
     def _claude_cli(
         self, cwd: Path, mission: str, system: str, wall: int
@@ -230,7 +278,7 @@ class Proposer:
                 ]
             else:
                 cmd += ["--append-system-prompt", system]
-        p = subprocess.run(
+        p = self._run_process(
             cmd,
             input=stdin,
             cwd=cwd,
@@ -291,7 +339,7 @@ class Proposer:
         ]
         if self.spec.effort:
             cmd += ["--variant", self.spec.effort]
-        p = subprocess.run(
+        p = self._run_process(
             cmd,
             cwd=cwd,
             env=env,
@@ -335,7 +383,33 @@ class Proposer:
         return {k: d / f"{safe}.{k}.md" for k in ("mission", "system", "response")} | {
             "meta": d / f"{safe}.meta.json",
             "workspace": d / f"{safe}.workspace",
+            "context": d / f"{safe}.context.json",
+            "attempts": d / f"{safe}.attempts.json",
         }
+
+    def _write_inputs(
+        self, label: str, cache_key: str, mission: str, system: str,
+        context_dir: Path | str | None,
+    ) -> None:
+        paths = self._paths(label, cache_key)
+        if not paths:
+            return
+        paths["mission"].write_text(mission, encoding="utf-8")
+        if system:
+            paths["system"].write_text(system, encoding="utf-8")
+        root = Path(context_dir) if context_dir else None
+        context = {
+            file.relative_to(root).as_posix(): file.read_text(encoding="utf-8", errors="replace")
+            for file in sorted(root.rglob("*")) if file.is_file()
+        } if root and root.is_dir() else {}
+        paths["context"].write_text(json.dumps(context, ensure_ascii=False, indent=2), encoding="utf-8")
+
+    def _write_attempts(self, label: str, cache_key: str, details: list[dict]) -> None:
+        paths = self._paths(label, cache_key)
+        if paths:
+            paths["attempts"].write_text(
+                json.dumps(details, ensure_ascii=False, indent=2), encoding="utf-8"
+            )
 
     def _cached(
         self, label: str, cache_key: str = "", *, require_workspace: bool = False
@@ -367,6 +441,7 @@ class Proposer:
         if system:
             p["system"].write_text(system, encoding="utf-8")
         p["response"].write_text(r.text, encoding="utf-8")
+        self._write_attempts(r.label, cache_key, r.attempt_details)
         p["meta"].write_text(
             json.dumps(
                 {

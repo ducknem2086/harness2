@@ -12,6 +12,7 @@ import socket
 import sys
 import threading
 import time
+import traceback
 from pathlib import Path
 
 from harness2 import config
@@ -25,7 +26,7 @@ from harness2.decisions.client import (
 )
 from harness2.decisions.improve import Outcome, improve, record
 from harness2.decisions.library import ExperienceLibrary
-from harness2.decisions.proposer import make_proposer
+from harness2.decisions.proposer import make_proposer, proposer_calls
 
 log = logging.getLogger("harness2.decision_worker")
 
@@ -90,6 +91,7 @@ def run_once(
     log.info("job %s: claimed", job.id)
     error: Exception | None = None
     outcome = None
+    call_start = len(proposer._calls)
     with _LeaseKeeper(client, job.id, heartbeat_seconds) as keeper:
         try:
             outcome = improve(job, client, proposer, library, k=k)
@@ -100,7 +102,10 @@ def run_once(
     if keeper.lost.is_set():
         return _lease_lost(job.id)
     if error is not None:
-        return _fail(client, job.id, error)
+        report = getattr(error, "report", {
+            "input": job.payload, "proposerCalls": proposer_calls(proposer, call_start),
+        })
+        return _fail(client, job.id, error, report)
     return _post_result(client, library, job, outcome)
 
 
@@ -121,7 +126,7 @@ def _post_result(client: DecisionClient, library: ExperienceLibrary, job: Job, o
         return _lease_lost(job.id)
     except ServiceError as exc:
         log.warning("job %s: the service did not take the %s result: %s", job.id, kind, exc)
-        return _fail(client, job.id, exc)
+        return _fail(client, job.id, exc, outcome.report)
     try:
         record(library, job, outcome, kind)
     except OSError as exc:
@@ -137,11 +142,17 @@ def _send(client: DecisionClient, job_id: str, outcome: Outcome) -> None:
         client.no_improvement(job_id, outcome.report)
 
 
-def _fail(client: DecisionClient, job_id: str, error: Exception) -> str:
+def _fail(client: DecisionClient, job_id: str, error: Exception, report: dict | None = None) -> str:
     reason = f"{type(error).__name__}: {error}"
     log.warning("job %s: failed: %s", job_id, reason)
     try:
-        client.fail(job_id, reason)
+        client.fail(job_id, reason, {
+            **(report or {}),
+            "error": {
+                "type": type(error).__name__, "message": str(error),
+                "traceback": "".join(traceback.format_exception(error)),
+            },
+        })
     except LeaseLost:
         return _lease_lost(job_id)
     except ServiceError as exc:
@@ -179,7 +190,12 @@ def build_parser() -> argparse.ArgumentParser:
         "--k", type=_positive_int, default=3, help="independent candidates per job (at least 1)"
     )
     parser.add_argument(
-        "--model", default="", help="Claude model for proposer sessions (empty: the CLI default)"
+        "--model", default="", help="model for proposer sessions (empty: the selected CLI default)"
+    )
+    parser.add_argument("--proposer", choices=("claude", "codex"), default="claude")
+    parser.add_argument(
+        "--codex-home", type=Path, default=None,
+        help="Codex configuration/login directory (empty: CODEX_HOME or ~/.codex)",
     )
     parser.add_argument("--library-dir", type=Path, default=config.RUNS / "decisions" / "library")
     parser.add_argument("--audit-dir", type=Path, default=config.RUNS / "decisions" / "audit")
@@ -208,7 +224,9 @@ def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     _configure_logging()
     client = DecisionClient(args.decision_url, args.worker_id, scoring_timeout=args.http_timeout)
-    proposer = make_proposer(args.model, args.audit_dir)
+    proposer = make_proposer(
+        args.model, args.audit_dir, proposer=args.proposer, codex_home=args.codex_home,
+    )
     library = ExperienceLibrary(args.library_dir)
     log.info("worker %s polling %s", args.worker_id, args.decision_url)
     try:

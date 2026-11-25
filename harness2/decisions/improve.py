@@ -20,7 +20,7 @@ from harness2.decisions.client import (
     Job,
 )
 from harness2.decisions.library import ExperienceLibrary
-from harness2.decisions.proposer import MISSION, SURFACE_PREFIX, propose
+from harness2.decisions.proposer import MISSION, SURFACE_PREFIX, propose, proposer_calls
 from harness2.decisions.surface import apply_files, changed, context_files, editable_files
 
 NO_NOTES = "Chưa có bài học nào từ các lần trước.\n"
@@ -76,9 +76,12 @@ def improve(
     originals = editable_files(payload)
     notes = library.notes(key) or NO_NOTES
     briefing = context_files(payload, None, notes)
+    call_start = len(proposer._calls)
+    candidates: list[_Candidate] = []
 
     def attempt(label: str, mission: str, extra: dict[str, str]) -> _Candidate:
         candidate = _Candidate(label)
+        candidates.append(candidate)
         client.heartbeat(job.id)
         try:
             candidate.files = propose(proposer, {**originals, **briefing, **extra}, mission, label)
@@ -100,19 +103,29 @@ def improve(
             candidate.error = f"the decision service could not score it: {exc}"
         return candidate
 
-    candidates = [attempt(f"{job.id}-p{i}", MISSION, {}) for i in range(k)]
+    try:
+        for i in range(k):
+            attempt(f"{job.id}-p{i}", MISSION, {})
 
-    graded = sorted((c for c in candidates if c.evaluation is not None), key=_rank)
-    if len(graded) >= 2:
-        first, second = graded[0], graded[1]
-        extra = {
-            **_candidate_files("brief/candidate_a/", first, payload["testCases"]),
-            **_candidate_files("brief/candidate_b/", second, payload["testCases"]),
-        }
-        candidates.append(attempt(f"{job.id}-compose", COMPOSE_MISSION, extra))
+        graded = sorted((c for c in candidates if c.evaluation is not None), key=_rank)
+        if len(graded) >= 2:
+            first, second = graded[0], graded[1]
+            extra = {
+                **_candidate_files("brief/candidate_a/", first, payload["testCases"]),
+                **_candidate_files("brief/candidate_b/", second, payload["testCases"]),
+            }
+            attempt(f"{job.id}-compose", COMPOSE_MISSION, extra)
+    except Exception as exc:
+        if candidates:
+            candidates[-1].error = f"{type(exc).__name__}: {exc}"
+        best = min((c for c in candidates if c.evaluation is not None), key=_rank, default=None)
+        exc.report = _report(payload, baseline, candidates, best)
+        exc.report["proposerCalls"] = proposer_calls(proposer, call_start)
+        raise
 
     best = min((c for c in candidates if c.evaluation is not None), key=_rank, default=None)
     report = _report(payload, baseline, candidates, best)
+    report["proposerCalls"] = proposer_calls(proposer, call_start)
     improved = best is not None and best.accuracy > baseline
     lesson = {
         "jobId": job.id,
@@ -194,10 +207,16 @@ def _report(
             f"đã đổi {', '.join(changes)}."
         )
     return {
+        "input": payload,
         "baselineAccuracy": baseline,
         "bestAccuracy": best_accuracy,
         "candidates": [
-            {"label": c.label, "accuracy": c.accuracy, "error": c.error} for c in candidates
+            {
+                "label": c.label, "accuracy": c.accuracy, "error": c.error,
+                "files": c.files, "questions": c.questions,
+                "results": c.evaluation.results if c.evaluation else None,
+                "changes": list(c.changes),
+            } for c in candidates
         ],
         "fixed": fixed,
         "stillFailing": still_failing,

@@ -112,10 +112,13 @@ class DecisionClient:
             {"worker": self.worker, "outcome": "no-improvement", "report": report},
         )
 
-    def fail(self, job_id: str, reason: str) -> None:
+    def fail(self, job_id: str, reason: str, report: dict | None = None) -> None:
+        body = {"worker": self.worker, "outcome": "failed", "reason": reason[:MAX_REASON]}
+        if report is not None:
+            body["report"] = report
         self._post(
             f"/api/harness/jobs/{job_id}/result",
-            {"worker": self.worker, "outcome": "failed", "reason": reason[:MAX_REASON]},
+            body,
         )
 
     @staticmethod
